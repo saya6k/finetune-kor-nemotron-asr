@@ -1,0 +1,52 @@
+# =============================================================================
+# Korean Fine-Tuning Overrides for Nemotron-3.5-ASR-Streaming-RNNT-Multilingual-Prompt
+# =============================================================================
+#
+# 이 파일은 참조 문서입니다. 실제 학습은 노트북 Cell 13의 CLI ++ 오버라이드를 사용합니다.
+# 노트북 외부에서 학습 스크립트를 실행할 때 이 파일을 --config-path로 지정할 수 있습니다.
+#
+# Usage (standalone):
+#   python speech_to_text_finetune.py \
+#     --config-path=../configs --config-name=override \
+#     +init_from_nemo_model=${HF_CKPT} \
+#     ++model.train_ds.manifest_filepath=... \
+#     ++model.validation_ds.manifest_filepath=...
+# =============================================================================
+
+model:
+  train_ds:
+    batch_duration: 200        # seconds of audio per batch; reduce if OOM
+    shuffle: true
+  optim:
+    name: adamw
+    lr: 0.0001                 # 1e-4 — preserves pretrained representations
+    weight_decay: 0.001
+    sched:
+      name: CosineAnnealing
+      warmup_ratio: 0.05       # 5% of total steps for warmup
+      min_lr: 1.0e-6           # minimum LR floor
+
+trainer:
+  devices: 1                   # Single GPU
+  max_epochs: 3                # 7,300h × 3 = 21,900h exposure is sufficient
+  precision: bf16              # bfloat16 for memory efficiency
+  gradient_clip_val: 1.0       # Gradient clipping for stability
+  # max_steps: NOT SET         # Do NOT combine with max_epochs — Lightning stops at whichever triggers first
+  # limit_train_batches: NOT SET — NeMo Issue #15782: silently limits data per epoch
+
+exp_manager:
+  resume_if_exists: true              # Resume from checkpoint (RunPod spot instance)
+  checkpoint_every_n_train_steps: 5000  # Save checkpoint every 5000 steps
+  save_top_k: 3                       # Keep only best 3 checkpoints (val_cer)
+  early_stopping_enabled: true
+  early_stopping_metric: "val_cer"
+  early_stopping_patience: 5          # 5 evaluations × 5000 steps = 25,000 steps patience
+  # version: NOT SET — use auto-increment
+
+# Seed for reproducibility
+seed_everything: 42
+
+# EMA (optional — test with A/B comparison first)
+# model_ema:
+#   enabled: true
+#   decay: 0.999
