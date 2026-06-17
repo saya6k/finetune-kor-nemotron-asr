@@ -137,15 +137,17 @@ def find_best_gpu(
 def create_pod(
     name: str,
     gpu_type: str,
-    image: str = "runpod/pytorch:2.4.0-py3.11-cuda12.4.0-devel-ubuntu22.04",
+    image: str = "runpod/pytorch:2.2.0-py3.10-cuda12.1.1-devel-ubuntu22.04",
+    cloud_type: str = "COMMUNITY",
     gpu_count: int = 1,
     container_disk_gb: int = 100,
     volume_gb: int = 50,
     volume_mount: str = "/workspace",
     env: Optional[Dict[str, str]] = None,
-    ports: str = "8888/http",
+    ports: str = "22/tcp",
     country_code: Optional[str] = None,
     start_ssh: bool = True,
+    support_public_ip: bool = True,
 ) -> Dict:
     """
     Create and start a GPU pod on RunPod.
@@ -154,17 +156,19 @@ def create_pod(
         name: Pod name.
         gpu_type: GPU type display name (e.g., "NVIDIA RTX 6000 Ada").
         image: Docker image name.
+        cloud_type: Cloud type: "COMMUNITY" (cheaper), "SECURE", or "ALL".
         gpu_count: Number of GPUs.
         container_disk_gb: Container disk size in GB.
         volume_gb: Persistent volume size in GB (0 = no volume).
         volume_mount: Volume mount path inside container.
         env: Environment variables dict.
-        ports: Port mapping string (e.g., "8888/http,22/tcp").
+        ports: Port mapping string (e.g., "22/tcp" for SSH).
         country_code: Preferred country (e.g., "US", "KR").
         start_ssh: Enable SSH access.
+        support_public_ip: Request a public IP address.
 
     Returns:
-        Pod info dict with keys: id, name, status, gpu_type, price_per_hour.
+        Pod info dict with keys: id, name, status, gpu_type, price_per_hour, public_ip.
     """
     rp = _init_runpod()
 
@@ -195,11 +199,12 @@ def create_pod(
     pod_env.setdefault('HF_HOME', '/workspace/.cache/huggingface')
 
     # Create pod
-    logger.info(f"Creating pod '{name}'...")
+    logger.info(f"Creating pod '{name}' (cloud: {cloud_type})...")
     pod = rp.create_pod(
         name=name,
         image_name=image,
         gpu_type_id=gpu_id,
+        cloud_type=cloud_type,
         gpu_count=gpu_count,
         container_disk_in_gb=container_disk_gb,
         volume_in_gb=volume_gb,
@@ -208,7 +213,7 @@ def create_pod(
         ports=ports,
         country_code=country_code,
         start_ssh=start_ssh,
-        support_public_ip=True,
+        support_public_ip=support_public_ip,
     )
 
     pod_id = pod.get('id')
@@ -229,6 +234,7 @@ def create_pod(
     info = info or rp.get_pod(pod_id) or {}
     gpu_price = gpu['lowestPrice']['price']
 
+    public_ip = (info.get('machine') or {}).get('publicIp', '')
     result = {
         'id': pod_id,
         'name': name,
@@ -240,11 +246,17 @@ def create_pod(
         'volume_mount': volume_mount,
         'machine': info.get('machine', {}),
         'pod_hostname': info.get('podHostname', ''),
+        'public_ip': public_ip,
+        'cloud_type': cloud_type,
     }
 
     logger.info(f"Pod ready: {pod_id}")
-    logger.info(f"  Price: ${gpu_price:.2f}/h")
-    logger.info(f"  SSH:   ssh root@{info.get('podHostname', 'N/A')} -p {info.get('runtime', {}).get('ports', [{}])[0].get('publicPort', 22)}")
+    logger.info(f"  Cloud:   {cloud_type}")
+    logger.info(f"  Price:   ${gpu_price:.2f}/h")
+    if public_ip:
+        logger.info(f"  SSH:     ssh root@{public_ip} -p 22")
+    elif result['pod_hostname']:
+        logger.info(f"  SSH:     ssh root@{result['pod_hostname']} -p {info.get('runtime', {}).get('ports', [{}])[0].get('publicPort', 22)}")
 
     return result
 
@@ -339,6 +351,7 @@ def pod_status(pod_id: Optional[str] = None) -> Dict:
         'estimated_cost': round(cost_to_date, 4),
         'gpu_type': info.get('machine', {}).get('gpuDisplayName', ''),
         'hostname': info.get('podHostname', ''),
+        'public_ip': (info.get('machine') or {}).get('publicIp', ''),
     }
 
 
@@ -601,7 +614,8 @@ class CostTracker:
 
 def launch_and_run(
     gpu_type: str = "NVIDIA RTX 6000 Ada",
-    image: str = "runpod/pytorch:2.4.0-py3.11-cuda12.4.0-devel-ubuntu22.04",
+    image: str = "runpod/pytorch:2.2.0-py3.10-cuda12.1.1-devel-ubuntu22.04",
+    cloud_type: str = "COMMUNITY",
     script: Optional[str] = None,
     pod_name: Optional[str] = None,
     volume_gb: int = 100,
@@ -634,6 +648,7 @@ def launch_and_run(
         name=pod_name,
         gpu_type=gpu_type,
         image=image,
+        cloud_type=cloud_type,
         volume_gb=volume_gb,
         container_disk_gb=container_disk_gb,
         volume_mount="/workspace",
@@ -646,14 +661,18 @@ def launch_and_run(
     print("  Pod Ready")
     print("=" * 60)
     for k, v in pod.items():
-        if k != 'machine':
+        if k not in ('machine',):
             print(f"  {k}: {v}")
     print("=" * 60)
-    print(f"\n  Connect:  ssh root@{pod['pod_hostname']}")
-    print(f"  Notebook: https://{pod['pod_hostname']}:8888")
-    print(f"\n  Stop:     python scripts/runpod_auto.py stop --pod-id {pod['id']}")
+    pub_ip = pod.get('public_ip', '')
+    hostname = pod.get('pod_hostname', '')
+    if pub_ip:
+        print(f"\n  SSH:     ssh root@{pub_ip} -p 22")
+    elif hostname:
+        print(f"\n  SSH:     ssh root@{hostname}")
+    print(f"  Stop:    python scripts/runpod_auto.py stop --pod-id {pod['id']}")
     print(f"  Terminate: python scripts/runpod_auto.py terminate --pod-id {pod['id']}")
-    print(f"  Monitor:  python scripts/runpod_auto.py status --pod-id {pod['id']}")
+    print(f"  Monitor: python scripts/runpod_auto.py status --pod-id {pod['id']}")
 
     if max_cost:
         print(f"\n  ⚠️  Auto-stop at ${max_cost:.2f} (estimate: "
@@ -684,8 +703,11 @@ if __name__ == "__main__":
     launch_p = sub.add_parser('launch', help='Create and start a GPU pod')
     launch_p.add_argument('--gpu-type', default=None,
                           help='GPU type name (auto-selects cheapest 48GB+ if omitted)')
+    launch_p.add_argument('--cloud-type', default='COMMUNITY',
+                          choices=['COMMUNITY', 'SECURE', 'ALL'],
+                          help='Cloud type: COMMUNITY (cheaper), SECURE, or ALL')
     launch_p.add_argument('--image',
-                          default='runpod/pytorch:2.4.0-py3.11-cuda12.4.0-devel-ubuntu22.04',
+                          default='runpod/pytorch:2.2.0-py3.10-cuda12.1.1-devel-ubuntu22.04',
                           help='Docker image')
     launch_p.add_argument('--pod-name', default=None, help='Pod name')
     launch_p.add_argument('--volume-gb', type=int, default=100,
@@ -739,6 +761,7 @@ if __name__ == "__main__":
         launch_and_run(
             gpu_type=args.gpu_type,
             image=args.image,
+            cloud_type=args.cloud_type,
             pod_name=args.pod_name,
             volume_gb=args.volume_gb,
             container_disk_gb=args.container_disk_gb,
