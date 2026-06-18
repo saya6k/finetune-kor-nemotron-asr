@@ -40,6 +40,7 @@ finetune-kor-nemotron-asr/
 │   ├── eval_checkpoints.py          # Multi-checkpoint × multi-dataset sweep
 │   ├── eval_direct.py               # Direct .nemo evaluation (prompt-aware)
 │   ├── patch_numba_codegen.py       # PTX version downgrade for driver 550
+│   ├── verify_on_pod.sh             # 7-step pre-flight verification script
 │   └── benchmark_gpu.py            # GPU speed/VRAM benchmark
 └── configs/
     └── override.yaml                # Korean FT hyperparameter reference
@@ -163,8 +164,15 @@ This applies:
 1. Numba PTX downgrade (8.7→8.4) for driver 550 compatibility
 2. nv_one_logger stub (NVIDIA internal package)
 3. Prompt model file copies (NeMo main → pip)
-4. torchcodec verification
-5. datasets Audio monkey-patch (soundfile backend)
+4. NeMo main branch clone verification
+5. WarpRNNT GPU compatibility check
+6. torchcodec verification + install
+7. datasets Audio monkey-patch (soundfile backend)
+8. Critical import verification (EncDecRNNTBPEModelWithPrompt)
+9. Base model existence check
+
+Verification script (`bash scripts/verify_on_pod.sh`) runs a 7-step smoke check:
+GPU → setup → imports → split logic → training params → eval_direct → tokenizer.
 
 ## Evaluation Datasets
 

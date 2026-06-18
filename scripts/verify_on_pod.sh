@@ -1,13 +1,18 @@
 #!/bin/bash
 # ============================================================================
-# Verification script — run ON the pod after SSH
+# Verification script — run ON the pod after git clone + SSH
 # Usage:
-#   1. rsync project from local:  rsync -avz -e "ssh -i ~/.ssh/id_ed25519" ./scripts/ 6o68szp21k8rq8-6441162f@ssh.runpod.io:/workspace/scripts/
-#   2. SSH in:                     ssh -i ~/.ssh/id_ed25519 6o68szp21k8rq8-6441162f@ssh.runpod.io
-#   3. Run:                        bash /workspace/scripts/verify_on_pod.sh
+#   1. git clone to pod (or rsync project)
+#   2. SSH in:  ssh root@<public-ip> -p <port>
+#   3. Run:     cd /workspace/finetune-kor-nemotron-asr && bash scripts/verify_on_pod.sh
 # ============================================================================
 set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 START_TIME=$(date +%s)
+
+# Detect Python 3.12 (required by runpod/pytorch:1.0.6-cu1281-torch260-ubuntu2204)
+PYTHON_BIN=$(which python3.12 2>/dev/null || which python3 2>/dev/null || echo "python3")
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 pass() { echo -e "${GREEN}✅ PASS${NC}: $1"; }
@@ -29,15 +34,16 @@ check "GPU detected"
 # ── 2. setup_environment.sh ─────────────────────────────────────
 echo ""
 echo "── [2/7] setup_environment.sh ──"
-cd /workspace
+cd "$PROJECT_DIR"
 bash scripts/setup_environment.sh 2>&1 | tail -30
 check "setup_environment.sh completed"
 
 # ── 3. Critical imports ─────────────────────────────────────────
 echo ""
 echo "── [3/7] Critical imports ──"
-export PYTHONPATH=/workspace/NeMo:$PYTHONPATH
-python3 -c "
+NEMO_DIR="${NEMO_DIR:-/workspace/NeMo}"
+export PYTHONPATH=${NEMO_DIR}:${PYTHONPATH}
+$PYTHON_BIN -c "
 from nemo.collections.asr.models import EncDecRNNTBPEModelWithPrompt
 from nemo.collections.asr.data.audio_to_text_lhotse_prompt_index import LhotseSpeechToTextBpeDatasetWithPromptIndex
 print('  Imports OK')
@@ -47,7 +53,7 @@ check "Prompt model imports"
 # ── 4. Data ingest + split logic ────────────────────────────────
 echo ""
 echo "── [4/7] Data ingest & split (SMOKE_N=100) ──"
-SMOKE_N=100 python3 -c "
+SMOKE_N=100 $PYTHON_BIN -c "
 import os, sys, json, random
 sys.path.insert(0, 'scripts')
 random.seed(42)
@@ -116,7 +122,7 @@ else
 fi
 
 # Verify training command structure
-python3 -c "
+$PYTHON_BIN -c "
 import shlex
 # Check critical params present
 cmd_parts = [
@@ -143,7 +149,7 @@ check "Training command params"
 # ── 6. eval_direct imports ─────────────────────────────────────
 echo ""
 echo "── [6/7] eval_direct.py ──"
-python3 -c "
+$PYTHON_BIN -c "
 import sys; sys.path.insert(0, 'scripts')
 from eval_direct import load_manifest, detect_lang, sweep_checkpoints_direct
 # Verify manifest parsing with synthetic data
@@ -167,7 +173,7 @@ check "eval_direct module"
 echo ""
 echo "── [7/7] Tokenizer verification ──"
 if [ -n "$HF_CKPT" ] && [ -f "$HF_CKPT" ]; then
-    python3 -c "
+    $PYTHON_BIN -c "
 import tarfile, os, sys
 ckpt = '$HF_CKPT'
 tok_dir = '/tmp/tok_test'
