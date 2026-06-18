@@ -1,0 +1,6 @@
+checkpoint,dataset,cer,wer,ser,num_samples
+FastConformer-Transducer-BPE-Prompt-Streaming.nemo,val_emilia_holdout_ko,30.86,44.31,99.70,1000
+FastConformer-Transducer-BPE-Prompt-Streaming.nemo,test_fleurs_ko,27.29,39.55,100.00,382
+FastConformer-Transducer-BPE-Prompt-Streaming.nemo,test_mixed_en,13.85,23.62,100.00,500
+FastConformer-Transducer-BPE-Prompt-Streaming.nemo,test_mixed_ja,33.27,163.81,100.00,500
+FastConformer-Transducer-BPE-Prompt-Streaming.nemo,test_mixed_zh,72.30,405.83,100.00,500

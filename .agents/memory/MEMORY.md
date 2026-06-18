@@ -1,0 +1,2 @@
+- [Dependency Compatibility Matrix](dependency-compatibility-matrix.md) — PyTorch, NeMo, CUDA version compatibility findings for RunPod ASR fine-tuning
+- [Source of Truth Setup](source-of-truth-setup.md) — Project memory and CLAUDE.md Source of Truth locations

@@ -11,16 +11,19 @@ Usage:
     python3 train_pipeline.py
 
 Env vars (all optional with defaults):
-    SMOKE_N=5000        Samples to process
+    SMOKE_N=0           Samples to process (0 = 전체 데이터, unlimited)
     HOLD_OUT_N=1000     Validation holdout samples
     MAX_EPOCHS=3        Training epochs
-    BATCH_DURATION=200  Batch size in seconds
+    BATCH_DURATION=100  Batch size in seconds (100 proven on L40S 48GB)
     HF_REPO_ID=saya6k/nemotron-kor-checkpoints
 """
 
 import os, sys, subprocess, logging, json, shlex, random, time, gc
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
+
+# Allow imports from sibling scripts
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # ── Logging ──────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -34,15 +37,70 @@ logger = logging.getLogger('train_pipeline')
 WORKSPACE = Path(os.environ.get('WORKSPACE', '/workspace'))
 DATA_DIR = Path(os.environ.get('DATA_DIR', str(WORKSPACE / 'data')))
 NEMO_DIR = Path(os.environ.get('NEMO_DIR', str(WORKSPACE / 'NeMo')))
-BATCH_DURATION = int(os.environ.get('BATCH_DURATION', '200'))
+BATCH_DURATION = int(os.environ.get('BATCH_DURATION', '100'))  # 100 proven on L40S 48GB
 MAX_EPOCHS = int(os.environ.get('MAX_EPOCHS', '3'))
-SMOKE_N = int(os.environ.get('SMOKE_N', '5000'))
+SMOKE_N = int(os.environ.get('SMOKE_N', '0'))  # 0 = 전체 데이터 (unlimited)
 HOLD_OUT_N = int(os.environ.get('HOLD_OUT_N', '1000'))
 TEST_HOLD_OUT_N = 500
 HF_REPO_ID = os.environ.get('HF_REPO_ID', 'saya6k/nemotron-kor-checkpoints')
 
 # Audio backend (avoid torchcodec CUDA mismatch)
 os.environ["DATASETS_AUDIO_BACKEND"] = "soundfile"
+
+# Monkey-patch datasets Audio to use soundfile instead of torchcodec.
+# Newer datasets (≥3.x) require torchcodec which conflicts with pod CUDA 12.1.
+# We patch both decode_example (bytes→array) and encode_example (array→dict).
+def _audio_bytes_to_array(value):
+    """Decode raw audio bytes to (array, sampling_rate) using soundfile."""
+    import soundfile as sf
+    import io
+    import numpy as np
+    array, sr = sf.read(io.BytesIO(value), dtype='float32')
+    return array, sr
+
+def _patch_datasets_audio():
+    """Replace datasets Audio decode/encode with soundfile-based versions."""
+    try:
+        import datasets.features.audio as _audio_mod
+        _orig_decode = _audio_mod.Audio.decode_example
+        _orig_encode = _audio_mod.Audio.encode_example
+
+        def _patched_decode(self, value, token_per_repo_id=None):
+            if isinstance(value, bytes):
+                array, sr = _audio_bytes_to_array(value)
+                return {"array": array, "sampling_rate": sr}
+            if isinstance(value, dict) and value.get('bytes'):
+                array, sr = _audio_bytes_to_array(value['bytes'])
+                result = {"array": array, "sampling_rate": sr}
+                if value.get('path'):
+                    result['path'] = value['path']
+                return result
+            if isinstance(value, dict) and value.get('array') is not None:
+                return value
+            return _orig_decode(self, value, token_per_repo_id=token_per_repo_id)
+
+        def _patched_encode(self, value):
+            import numpy as np
+            if isinstance(value, bytes):
+                array, sr = _audio_bytes_to_array(value)
+                return {"array": array, "sampling_rate": sr}
+            if isinstance(value, dict) and value.get('bytes'):
+                array, sr = _audio_bytes_to_array(value['bytes'])
+                result = {"array": array, "sampling_rate": sr}
+                if value.get('path'):
+                    result['path'] = value['path']
+                return result
+            if isinstance(value, dict) and value.get('array') is not None:
+                return value
+            if isinstance(value, np.ndarray):
+                return {"array": value, "sampling_rate": self.sampling_rate or 16000}
+            return _orig_encode(self, value)
+
+        _audio_mod.Audio.decode_example = _patched_decode
+        _audio_mod.Audio.encode_example = _patched_encode
+        logger.info("Audio patch: soundfile 기반으로 datasets Audio 우회 (decode+encode)")
+    except Exception as e:
+        logger.warning(f"Audio patch 실패 (fallback to torchcodec): {e}")
 
 random.seed(42)
 
@@ -88,25 +146,84 @@ def setup() -> Dict:
         'wget', 'text-unidecode', 'matplotlib>=3.3.2', 'Cython'], check=False)
     subprocess.run([sys.executable, '-m', 'pip', 'install', '-q',
         'huggingface-hub', 'librosa', 'datasets', 'soundfile', 'tqdm',
-        'jiwer', 'gTTS', 'runpod'], check=False)
+        'jiwer', 'gTTS', 'runpod', 'sentencepiece', 'torchcodec'], check=False)
     subprocess.run(['apt-get', 'install', '-y', '-qq',
         'sox', 'libsndfile1', 'ffmpeg', 'libsox-fmt-mp3', 'jq'],
         check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    # NeMo install from main branch
-    logger.info("NeMo 설치 중...")
+    # cuDNN 9 (required by NeMo, installed via pip into Python package dir)
+    subprocess.run([sys.executable, '-m', 'pip', 'install', '-q',
+        'nvidia-cudnn-cu12>=9', 'nvidia-nvjitlink-cu12'], check=False)
+    py_ver = f'python{sys.version_info.major}.{sys.version_info.minor}'
+    cudnn_lib = f'/usr/local/lib/{py_ver}/dist-packages/nvidia/cudnn/lib'
+    if os.path.isdir(cudnn_lib):
+        os.environ['LD_LIBRARY_PATH'] = cudnn_lib + ':' + os.environ.get('LD_LIBRARY_PATH', '')
+
+    # NeMo 2.7.3 pip + main branch source
+    # - pip 2.7.3: stable base with all dependencies
+    # - main branch: prompt model (EncDecRNNTBPEModelWithPrompt), streaming config
+    logger.info("NeMo 2.7.3 (pip) + main branch (source) 설치 중...")
     subprocess.run(
         [sys.executable, '-m', 'pip', 'install', '-q',
-         'nemo_toolkit[asr]@git+https://github.com/NVIDIA/NeMo.git@main'],
+         'nemo_toolkit[asr]==2.7.3'],
         check=False
     )
 
-    # Clone NeMo source for example scripts
     if not NEMO_DIR.exists():
-        logger.info(f"NeMo 소스 클론 중... {NEMO_DIR}")
-        subprocess.run(['git', 'clone', '-b', 'main',
-            'https://github.com/NVIDIA-NeMo/NeMo', str(NEMO_DIR)], check=True)
+        logger.info(f"NeMo main 클론 중... {NEMO_DIR}")
+        subprocess.run(['git', 'clone', '--depth', '1',
+            'https://github.com/NVIDIA/NeMo.git', str(NEMO_DIR)], check=True)
     os.environ["PYTHONPATH"] = f"{NEMO_DIR}:{os.environ.get('PYTHONPATH', '')}"
+
+    # ── Critical patches for driver 550 compatibility ──────────────────
+    # Numba PTX downgrade: CUDA 12.8 toolkit → PTX 8.7, driver supports max 8.4
+    logger.info("Numba PTX 패치 적용 중...")
+    patch_script = Path(__file__).resolve().parent / 'patch_numba_codegen.py'
+    if patch_script.exists():
+        subprocess.run([sys.executable, str(patch_script)], check=False)
+    else:
+        logger.warning(f"patch_numba_codegen.py not found at {patch_script}")
+
+    # nv_one_logger stub (NVIDIA internal package, not on PyPI)
+    logger.info("nv_one_logger stub 생성 중...")
+    nemo_lightning_dir = Path(f'/usr/local/lib/{py_ver}/dist-packages/nemo/lightning')
+    nemo_lightning_dir.mkdir(parents=True, exist_ok=True)
+    stub_path = nemo_lightning_dir / 'one_logger_callback.py'
+    stub_path.write_text(
+        '"""Stub: nv_one_logger is NVIDIA internal, not available on PyPI."""\n'
+        'from lightning.pytorch.callbacks import Callback\n'
+        'class OneLoggerNeMoCallback(Callback):\n'
+        '    def __init__(self, *args, **kwargs):\n'
+        '        super().__init__()\n'
+    )
+    logger.info(f"  Stub created: {stub_path}")
+
+    # Copy prompt model files from main branch to pip install location
+    logger.info("Prompt model 파일 복사 중...")
+    pkg_nemo = f'/usr/local/lib/{py_ver}/dist-packages/nemo'
+    for src_rel, dst_rel in [
+        ('nemo/collections/asr/models/rnnt_bpe_models_prompt.py',
+         'collections/asr/models/rnnt_bpe_models_prompt.py'),
+        ('nemo/collections/asr/data/audio_to_text_lhotse_prompt_index.py',
+         'collections/asr/data/audio_to_text_lhotse_prompt_index.py'),
+    ]:
+        src = NEMO_DIR / src_rel
+        dst = Path(pkg_nemo) / dst_rel
+        if src.exists():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_text(src.read_text())
+            logger.info(f"  Copied: {dst_rel}")
+        else:
+            logger.warning(f"  MISSING: {src}")
+
+    # Copy mixins for PromptStreamingMixin
+    mixins_src = NEMO_DIR / 'nemo/collections/asr/parts/mixins'
+    mixins_dst = Path(pkg_nemo) / 'collections/asr/parts/mixins'
+    mixins_dst.mkdir(parents=True, exist_ok=True)
+    for f in mixins_src.glob('*.py'):
+        dst = mixins_dst / f.name
+        dst.write_text(f.read_text())
+    logger.info("  Copied mixins")
 
     # .nemo model resolution
     hf_ckpt = os.environ.get('HF_CKPT', '')
@@ -160,6 +277,7 @@ def data_ingest() -> Tuple[str, int]:
     import soundfile as sf
     import librosa
     from datasets import load_dataset
+    _patch_datasets_audio()  # apply after datasets is available
 
     logger.info("Emilia-YODAS Korean streaming 시작 (stream-to-file)...")
     logger.info(f"  SMOKE_N: {SMOKE_N}")
@@ -178,14 +296,16 @@ def data_ingest() -> Tuple[str, int]:
 
     with open(temp_path, 'w', encoding='utf-8') as f:
         for sample in ds:
-            text = sample.get('text', '').strip()
+            # Emilia-YODAS structure: json.text + mp3 (24kHz MP3 audio)
+            meta = sample.get('json', {})
+            text = meta.get('text', '').strip()
             if not text:
                 skipped_text += 1
                 continue
 
             # WAV conversion (with cache)
-            audio = sample['audio']
-            sample_id = sample.get('id', str(abs(hash(text))))
+            audio = sample['mp3']
+            sample_id = meta.get('_id', sample.get('__key__', str(abs(hash(text)))))
             wav_filename = f"ko_{sample_id}.wav".replace('/', '_')
             wav_path = WAV_CACHE_DIR / wav_filename
 
@@ -213,7 +333,7 @@ def data_ingest() -> Tuple[str, int]:
             if entries_written % 1000 == 0:
                 logger.info(f"  {entries_written} entries written...")
 
-            if entries_written >= SMOKE_N:
+            if SMOKE_N > 0 and entries_written >= SMOKE_N:
                 logger.info(f"SMOKE_N={SMOKE_N} 도달, 처리 중단")
                 break
 
@@ -247,18 +367,22 @@ def build_manifests(temp_path: str) -> Dict[str, str]:
     random.shuffle(all_entries)
     logger.info(f"  총 entries: {len(all_entries)}")
 
-    # Split
+    # Split: val holdout from front, test holdout from back, train from middle
     holdout_entries = all_entries[:HOLD_OUT_N]
-    rest_entries = all_entries[HOLD_OUT_N:]
+    middle_entries = all_entries[HOLD_OUT_N:]
 
-    # Train: next SMOKE_N entries (or all remaining if < SMOKE_N)
-    train_n = min(SMOKE_N, len(rest_entries))
-    train_entries = rest_entries[:train_n]
+    # Reserve TEST_HOLD_OUT_N from the end for test holdout
+    if len(middle_entries) > TEST_HOLD_OUT_N:
+        test_holdout_entries = middle_entries[-TEST_HOLD_OUT_N:]
+        train_pool = middle_entries[:-TEST_HOLD_OUT_N]
+    else:
+        # Not enough data for a separate test holdout — use all remaining for train
+        test_holdout_entries = []
+        train_pool = middle_entries
 
-    # Test holdout: entries after train, up to TEST_HOLD_OUT_N
-    test_start = train_n
-    test_end = min(test_start + TEST_HOLD_OUT_N, len(rest_entries))
-    test_holdout_entries = rest_entries[test_start:test_end]
+    # Train: SMOKE_N=0이면 전체, 아니면 SMOKE_N까지만
+    train_n = len(train_pool) if SMOKE_N == 0 else min(SMOKE_N, len(train_pool))
+    train_entries = train_pool[:train_n]
 
     manifests = {}
 
@@ -347,6 +471,7 @@ def language_mix(manifests: Dict[str, str]) -> str:
     import soundfile as sf
     import librosa
     from datasets import load_dataset
+    _patch_datasets_audio()  # apply after datasets is available
 
     lang_mix = {
         "ko": float(os.environ.get('LANG_MIX_KO', '0.80')),
@@ -361,6 +486,12 @@ def language_mix(manifests: Dict[str, str]) -> str:
     with open(ko_path, 'r', encoding='utf-8') as f:
         ko_entries = [json.loads(line) for line in f if line.strip()]
     n_ko = len(ko_entries)
+    if n_ko == 0:
+        raise RuntimeError(
+            "Korean train manifest is empty. "
+            "Check: (1) SMOKE_N is set correctly, (2) data ingest produced entries, "
+            "(3) build_manifests split didn't allocate all entries to holdout."
+        )
 
     total_entries = int(n_ko / lang_mix["ko"])
     other_total = total_entries - n_ko
@@ -393,12 +524,13 @@ def language_mix(manifests: Dict[str, str]) -> str:
             for sample in other_ds:
                 if len(lang_entries) >= target_n + 500:
                     break
-                text = sample.get('text', '').strip()
+                meta = sample.get('json', {})
+                text = meta.get('text', '').strip()
                 if not text:
                     continue
 
-                audio = sample['audio']
-                sample_id = sample.get('id', str(abs(hash(text))))
+                audio = sample['mp3']
+                sample_id = meta.get('_id', sample.get('__key__', str(abs(hash(text)))))
                 wav_filename = f"{lang_code}_{sample_id}.wav".replace('/', '_')
                 wav_path = WAV_CACHE_DIR / wav_filename
 
@@ -461,13 +593,30 @@ def language_mix(manifests: Dict[str, str]) -> str:
 # ╚═════════════════════════════════════════════════════════════════════╝
 
 def verify_tokenizer(hf_ckpt: str) -> bool:
-    """Check tokenizer coverage and jamo decomposition on Korean text."""
-    import nemo.collections.asr as nemo_asr
+    """Check tokenizer coverage and jamo decomposition on Korean text.
+
+    Extracts SentencePiece tokenizer from the .nemo tar archive directly,
+    avoiding PyTorch/CUDA version conflicts from full model loading.
+    """
+    import tarfile
     import unicodedata
 
     logger.info("Tokenizer 검증 중...")
-    model = nemo_asr.models.EncDecRNNTBPEModel.from_pretrained(hf_ckpt)
-    tokenizer = model.tokenizer
+
+    # Extract tokenizer.model from .nemo tar (avoid full model load)
+    tokenizer_model_path = CHECKPOINT_DIR / '_extracted_tokenizer.model'
+    with tarfile.open(hf_ckpt, 'r') as tar:
+        tok_files = [n for n in tar.getnames() if n.endswith('_tokenizer.model')]
+        if not tok_files:
+            logger.error("Tokenizer model not found in .nemo archive")
+            return False
+        tok_member = tar.getmember(tok_files[0])
+        tok_member.name = '_extracted_tokenizer.model'
+        tar.extract(tok_member, str(CHECKPOINT_DIR))
+
+    import sentencepiece as spm
+    tokenizer = spm.SentencePieceProcessor()
+    tokenizer.Load(str(tokenizer_model_path))
 
     test_texts = [
         "안녕하세요, 음성 인식 모델입니다.",
@@ -479,8 +628,8 @@ def verify_tokenizer(hf_ckpt: str) -> bool:
 
     total_orig, total_decoded = 0, 0
     for text in test_texts:
-        tokens = tokenizer.text_to_ids(text)
-        decoded = tokenizer.ids_to_text(tokens)
+        ids = tokenizer.EncodeAsIds(text)
+        decoded = tokenizer.DecodeIds(ids)
         total_orig += len(text.replace(' ', ''))
         total_decoded += len(decoded.replace(' ', ''))
         logger.info(f"  {text[:40]}... → {decoded[:40]}...")
@@ -490,7 +639,7 @@ def verify_tokenizer(hf_ckpt: str) -> bool:
 
     # Jamo decomposition check
     sample = "안녕하세요"
-    decoded = tokenizer.ids_to_text(tokenizer.text_to_ids(sample))
+    decoded = tokenizer.DecodeIds(tokenizer.EncodeAsIds(sample))
     nfd = unicodedata.normalize('NFD', decoded)
     has_jamo = any(0x1100 <= ord(c) <= 0x11FF or 0x3130 <= ord(c) <= 0x318F for c in nfd)
 
@@ -501,13 +650,17 @@ def verify_tokenizer(hf_ckpt: str) -> bool:
 
     if coverage >= 0.98:
         logger.info(f"✅ Tokenizer 양호: {coverage:.1%} ≥ 98%")
-        return True
+        ok = True
     elif coverage >= 0.80:
         logger.warning(f"⚠️  Coverage 부족: {coverage:.1%} < 98%")
-        return False
+        ok = False
     else:
         logger.error(f"❌ Coverage 심각: {coverage:.1%} < 80%")
-        return False
+        ok = False
+
+    # Cleanup extracted tokenizer
+    os.remove(tokenizer_model_path)
+    return ok
 
 
 # ╔═════════════════════════════════════════════════════════════════════╗
@@ -533,29 +686,46 @@ def train(hf_ckpt: str, mixed_manifest: str, val_manifest: str) -> int:
         f'+init_from_nemo_model={shlex.quote(hf_ckpt)}',
         f'++model.train_ds.manifest_filepath={shlex.quote(mixed_manifest)}',
         f'++model.validation_ds.manifest_filepath={shlex.quote(val_manifest)}',
+        f'++model.tokenizer.dir={shlex.quote(str(CHECKPOINT_DIR))}',
         '++trainer.devices=1',
         f'++trainer.max_epochs={MAX_EPOCHS}',
         '++trainer.precision=bf16',
         '++trainer.gradient_clip_val=1.0',
         '++seed_everything=42',
         f'++model.train_ds.batch_duration={BATCH_DURATION}',
+        '++model.validation_ds.batch_size=1',        # prevent val OOM
+        '++model.train_ds.max_duration=20',           # prevent OOM on long samples
         '++model.optim.name=adamw',
         '++model.optim.lr=0.0001',
         '++model.optim.weight_decay=0.001',
         '++model.optim.sched.name=CosineAnnealing',
         '++model.optim.sched.warmup_ratio=0.05',
+        '++model.optim.sched.warmup_steps=null',      # use ratio, not steps
+        '++model.optim.sched.d_model=1024',           # explicit: OmegaConf can't resolve
         '++model.optim.sched.min_lr=1e-6',
         f'++exp_manager.exp_dir={shlex.quote(str(CHECKPOINT_DIR))}',
         '++exp_manager.resume_if_exists=true',
-        '++exp_manager.checkpoint_every_n_train_steps=5000',
-        '++exp_manager.save_top_k=3',
-        '++exp_manager.early_stopping_enabled=true',
-        '++exp_manager.early_stopping_metric=val_cer',
-        '++exp_manager.early_stopping_patience=5',
+        '++exp_manager.resume_ignore_no_checkpoint=true',
+        '++exp_manager.create_early_stopping_callback=true',
+        '++exp_manager.early_stopping_callback_params.monitor=val_wer',
+        '++exp_manager.early_stopping_callback_params.patience=5',
+        '++exp_manager.checkpoint_callback_params.save_top_k=3',
+        '++exp_manager.checkpoint_callback_params.monitor=val_wer',
     ]
 
     logger.info(f"Command: {' '.join(cmd[:3])} ... (truncated)")
-    result = subprocess.run(cmd, cwd=str(NEMO_DIR / 'examples' / 'asr'))
+    # Pass pip-installed CUDA libraries (cuDNN 9, nvJitLink) before system paths
+    env = os.environ.copy()
+    py_ver = f'python{sys.version_info.major}.{sys.version_info.minor}'
+    pip_cuda_libs = [
+        f'/usr/local/lib/{py_ver}/dist-packages/nvidia/cudnn/lib',
+        f'/usr/local/lib/{py_ver}/dist-packages/nvidia/nvjitlink/lib',
+        '/usr/local/cuda/lib64',
+        f'/usr/local/cuda-{os.environ.get("CUDA_VERSION", "12.4")}/targets/x86_64-linux/lib',
+    ]
+    ld_paths = [p for p in pip_cuda_libs if os.path.isdir(p)]
+    env['LD_LIBRARY_PATH'] = ':'.join(ld_paths + [env.get('LD_LIBRARY_PATH', '')])
+    result = subprocess.run(cmd, cwd=str(NEMO_DIR / 'examples' / 'asr'), env=env)
     logger.info(f"Training 완료 (exit code: {result.returncode})")
     return result.returncode
 
@@ -595,8 +765,12 @@ def backup_checkpoint() -> Optional[str]:
 # ╚═════════════════════════════════════════════════════════════════════╝
 
 def eval_sweep(manifests: Dict[str, str]) -> str:
-    """Run checkpoint sweep evaluation across all eval datasets."""
-    from eval_checkpoints import sweep_checkpoints
+    """Run checkpoint sweep evaluation across all eval datasets using direct eval.
+
+    Uses eval_direct.py which monkey-patches the prompt dataloader to handle
+    Cut language=None bug, bypassing NeMo Hydra inference entirely.
+    """
+    from eval_direct import sweep_checkpoints_direct
 
     # Build eval dataset dict (exclude training manifests)
     eval_datasets = {}
@@ -627,12 +801,10 @@ def eval_sweep(manifests: Dict[str, str]) -> str:
         logger.info(f"  {k}: {v}")
 
     output_csv = str(RESULTS_DIR / 'checkpoint_eval.csv')
-    return sweep_checkpoints(
+    return sweep_checkpoints_direct(
         checkpoint_dir=str(CHECKPOINT_DIR),
         datasets=eval_datasets,
-        nemo_dir=str(NEMO_DIR),
         output_csv=output_csv,
-        target_lang="ko-KR",
     )
 
 

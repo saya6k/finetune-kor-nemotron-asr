@@ -1,0 +1,7 @@
+.env
+.env
+data/
+checkpoints/
+__pycache__/
+*.pyc
+NeMo/

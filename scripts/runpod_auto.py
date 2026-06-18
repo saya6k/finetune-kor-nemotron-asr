@@ -19,7 +19,7 @@ Usage:
     # Launch a pod and run training
     python runpod_auto.py launch \
         --gpu-type "NVIDIA RTX 6000 Ada" \
-        --image "nvidia/nemo:latest" \
+        --image "runpod/pytorch:1.0.6-cu1281-torch260-ubuntu2204" \
         --volume /workspace:50 \
         --env HF_CKPT=/workspace/model.nemo \
         --script train.sh \
@@ -137,7 +137,7 @@ def find_best_gpu(
 def create_pod(
     name: str,
     gpu_type: str,
-    image: str = "runpod/pytorch:2.2.0-py3.10-cuda12.1.1-devel-ubuntu22.04",
+    image: str = "runpod/pytorch:1.0.6-cu1281-torch260-ubuntu2204",
     cloud_type: str = "COMMUNITY",
     gpu_count: int = 1,
     container_disk_gb: int = 100,
@@ -232,9 +232,16 @@ def create_pod(
         logger.warning("Pod may not be ready yet. Check manually.")
 
     info = info or rp.get_pod(pod_id) or {}
-    gpu_price = gpu['lowestPrice']['price']
+    # API v2: pricing from pod info, not GPU list
+    gpu_price = info.get('costPerHr', 0) or 0
 
+    # Extract public IP from runtime ports (new API) or machine.publicIp (old API)
     public_ip = (info.get('machine') or {}).get('publicIp', '')
+    if not public_ip:
+        for port in (info.get('runtime') or {}).get('ports', []):
+            if port.get('isIpPublic') and port.get('privatePort') == 22:
+                public_ip = port.get('ip', '')
+                break
     result = {
         'id': pod_id,
         'name': name,
@@ -614,7 +621,7 @@ class CostTracker:
 
 def launch_and_run(
     gpu_type: str = "NVIDIA RTX 6000 Ada",
-    image: str = "runpod/pytorch:2.2.0-py3.10-cuda12.1.1-devel-ubuntu22.04",
+    image: str = "runpod/pytorch:1.0.6-cu1281-torch260-ubuntu2204",
     cloud_type: str = "COMMUNITY",
     script: Optional[str] = None,
     pod_name: Optional[str] = None,
@@ -707,7 +714,7 @@ if __name__ == "__main__":
                           choices=['COMMUNITY', 'SECURE', 'ALL'],
                           help='Cloud type: COMMUNITY (cheaper), SECURE, or ALL')
     launch_p.add_argument('--image',
-                          default='runpod/pytorch:2.2.0-py3.10-cuda12.1.1-devel-ubuntu22.04',
+                          default='runpod/pytorch:1.0.6-cu1281-torch260-ubuntu2204',
                           help='Docker image')
     launch_p.add_argument('--pod-name', default=None, help='Pod name')
     launch_p.add_argument('--volume-gb', type=int, default=100,
