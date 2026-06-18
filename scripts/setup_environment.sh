@@ -11,8 +11,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PYTHON_BIN=$(ls /usr/local/bin/python3.* 2>/dev/null | head -1)
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+PYTHON_BIN=$(which python3 2>/dev/null || echo "python3")
 SENTINEL="/workspace/.setup_done"
 
 if [ -f "$SENTINEL" ]; then
