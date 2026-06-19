@@ -1,2 +1,3 @@
 - [Dependency Compatibility Matrix](dependency-compatibility-matrix.md) — PyTorch, NeMo, CUDA version compatibility findings for RunPod ASR fine-tuning
 - [Source of Truth Setup](source-of-truth-setup.md) — Project memory and CLAUDE.md Source of Truth locations
+- [DGX Station Container Setup](dgx-station-container-setup.md) — docker run command, volume mounts (/raid/workspace, /raid/hf_cache), container path structure for GB300 DGX Station

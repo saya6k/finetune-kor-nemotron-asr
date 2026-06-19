@@ -177,12 +177,17 @@ def setup() -> Dict:
 
     # ── Critical patches for driver 550 compatibility ──────────────────
     # Numba PTX downgrade: CUDA 12.8 toolkit → PTX 8.7, driver supports max 8.4
-    logger.info("Numba PTX 패치 적용 중...")
-    patch_script = Path(__file__).resolve().parent / 'patch_numba_codegen.py'
-    if patch_script.exists():
-        subprocess.run([sys.executable, str(patch_script)], check=False)
+    # Skipped on Blackwell (sm_100+): toolkit/driver match, no PTX version clash
+    _sm_major = torch.cuda.get_device_capability(0)[0] if torch.cuda.is_available() else 0
+    if _sm_major >= 10:
+        logger.info("Blackwell sm_100 감지 — Numba PTX 패치 건너뜀 (PTX 9.x 네이티브 지원)")
     else:
-        logger.warning(f"patch_numba_codegen.py not found at {patch_script}")
+        logger.info("Numba PTX 패치 적용 중...")
+        patch_script = Path(__file__).resolve().parent / 'patch_numba_codegen.py'
+        if patch_script.exists():
+            subprocess.run([sys.executable, str(patch_script)], check=False)
+        else:
+            logger.warning(f"patch_numba_codegen.py not found at {patch_script}")
 
     # nv_one_logger stub (NVIDIA internal package, not on PyPI)
     logger.info("nv_one_logger stub 생성 중...")
@@ -717,11 +722,13 @@ def train(hf_ckpt: str, mixed_manifest: str, val_manifest: str) -> int:
     # Pass pip-installed CUDA libraries (cuDNN 9, nvJitLink) before system paths
     env = os.environ.copy()
     py_ver = f'python{sys.version_info.major}.{sys.version_info.minor}'
+    import platform as _platform
+    _arch = "aarch64-linux" if _platform.machine() == "aarch64" else "x86_64-linux"
     pip_cuda_libs = [
         f'/usr/local/lib/{py_ver}/dist-packages/nvidia/cudnn/lib',
         f'/usr/local/lib/{py_ver}/dist-packages/nvidia/nvjitlink/lib',
         '/usr/local/cuda/lib64',
-        f'/usr/local/cuda-{os.environ.get("CUDA_VERSION", "12.4")}/targets/x86_64-linux/lib',
+        f'/usr/local/cuda-{os.environ.get("CUDA_VERSION", "12.4")}/targets/{_arch}/lib',
     ]
     ld_paths = [p for p in pip_cuda_libs if os.path.isdir(p)]
     env['LD_LIBRARY_PATH'] = ':'.join(ld_paths + [env.get('LD_LIBRARY_PATH', '')])
