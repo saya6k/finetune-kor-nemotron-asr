@@ -22,6 +22,13 @@ import os, sys, subprocess, logging, json, shlex, random, time, gc
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
 
+def _nemo_major() -> int:
+    try:
+        import nemo as _n
+        return int(_n.__version__.split('.')[0])
+    except Exception:
+        return 2
+
 # Allow imports from sibling scripts
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -710,8 +717,10 @@ def train(hf_ckpt: str, mixed_manifest: str, val_manifest: str) -> int:
         '++model.optim.sched.name=CosineAnnealing',
         '++model.optim.sched.warmup_ratio=0.05',
         '++model.optim.sched.warmup_steps=null',      # use ratio, not steps
-        '++model.optim.sched.d_model=1024',           # explicit: OmegaConf can't resolve
         '++model.optim.sched.min_lr=1e-6',
+        # NeMo 2.x: CosineAnnealing YAML references ${model.encoder.d_model}; must set explicit value.
+        # NeMo 3.x: WarmupAnnealHoldPolicy rejects d_model; must delete from .nemo embedded config.
+        *(['++model.optim.sched.d_model=1024'] if _nemo_major() < 3 else ['~model.optim.sched.d_model']),
         f'++exp_manager.exp_dir={shlex.quote(str(CHECKPOINT_DIR))}',
         '++exp_manager.resume_if_exists=true',
         '++exp_manager.resume_ignore_no_checkpoint=true',

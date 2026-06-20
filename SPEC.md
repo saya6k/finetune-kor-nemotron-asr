@@ -32,152 +32,134 @@
 
 ## 2. Platform 비교
 
-| 항목 | RunPod (검증됨) | GB300 DGX Station (탐구) |
+| 항목 | RunPod (검증됨) | GB300 DGX Station (확인됨) |
 |------|----------------|--------------------------|
 | CPU 아키텍처 | x86_64 | **aarch64** (NVIDIA Grace ARM) |
-| GPU 아키텍처 | Ada Lovelace sm_89 (L40S) | **Blackwell sm_100** |
-| VRAM | 48GB GDDR6 | **~192GB HBM3e** (예상, 모델별 상이) |
+| GPU 아키텍처 | Ada Lovelace sm_89 (L40S) | **Blackwell sm_103** (실측) |
+| VRAM | 48GB GDDR6 | **276.5 GiB** (nominal 284 GiB, 실측) |
 | CPU-GPU 연결 | PCIe | **NVLink-C2C** (통합 메모리) |
-| 컨테이너 | runpod/pytorch (직접 pip 설치) | **NGC NeMo 공식 컨테이너** |
-| CUDA toolkit | 12.8 (driver 12.4와 불일치) | 일치 예상 (DGX 관리형) |
-| nv_one_logger | 미포함 → stub 필요 | NGC 컨테이너에 포함 추정 |
-| GPU 수 | 1 | 1 (초기 검증) |
+| 컨테이너 | runpod/pytorch (직접 pip 설치) | **`nvcr.io/nvidia/pytorch:26.05-py3` + `Dockerfile.dgx`** |
+| CUDA toolkit | 12.8 (driver 12.4와 불일치) | Driver 595.58.03, toolkit 12.9 |
+| nv_one_logger | 미포함 → stub 필요 | **미포함** (Dockerfile에서 stub 처리) |
+| GPU 수 | 1 | 1 (단일 GPU) |
+| GPU 공유 서비스 | 없음 | **DeepSeek-V4-Flash VLLM 상시 실행** (학습 전 조율 필요) |
 
 ---
 
-## 3. NGC 컨테이너 선택
+## 3. 컨테이너 선택 (확정됨)
 
-### 조건
-- aarch64 멀티아치 빌드 지원
-- NeMo ≥ 2.8 (Blackwell sm_100 지원 확인 필요)
-- CUDA ≥ 12.8 (Blackwell 공식 지원 최소 버전)
-- PyTorch ≥ 2.6 (기존 검증 버전)
+### 결론: `nvcr.io/nvidia/pytorch:26.05-py3` + `Dockerfile.dgx`
 
-### 탐색 순서
-```bash
-# 1. aarch64 지원 여부 확인
-docker manifest inspect nvcr.io/nvidia/nemo:latest | jq '.manifests[].platform'
+`nvcr.io/nvidia/nemo:latest`는 aarch64에서 `lightning` (PyTorch Lightning 2.x) 미포함 — 학습용 컨테이너가 아닌 추론용. `nvcr.io/nvidia/pytorch:26.05-py3`를 base로 커스텀 Dockerfile을 사용함 (이미지 태그: `nemotron-asr-dgx:latest`, 24.1 GiB).
 
-# 2. GPU 인식 + Blackwell 확인
-python3 -c "
-import torch
-p = torch.cuda.get_device_properties(0)
-print(f'GPU: {p.name}')
-print(f'SM: {p.major}.{p.minor}')   # Blackwell → 10.0
-print(f'VRAM: {p.total_memory / 1e9:.1f} GB')
-"
+**NeMo git main (3.1.0+8044a39)** 사용 이유: NVIDIA 공식 블로그에서 "NeMo 26.06+"을 요구하는데 NGC 컨테이너가 아직 미출시(2026-06-20 기준); git main이 동등.
 
-# 3. NeMo 버전 확인
-python3 -c "import nemo; print(nemo.__version__)"
-```
-
-### 후보 컨테이너 (2026-06 기준)
-```
-nvcr.io/nvidia/nemo:latest           # 최우선 시도
-nvcr.io/nvidia/nemo:25.XX.XX         # 특정 릴리즈 (TBD)
-nvcr.io/nvidia/pytorch:25.XX-py3     # NeMo 없이 PyTorch만
-```
-
-### 컨테이너 실행 명령
+### 빌드된 이미지
 
 ```bash
-docker run --gpus all -it --rm \
-  --shm-size=64g \
-  --ulimit memlock=-1 \
-  --ipc=host \
-  -v /raid/workspace:/workspace \
-  -v /raid/hf_cache:/root/.cache/huggingface \
+# DGX에서 한 번만 실행 (24.1 GiB, ~10분 소요)
+cd /root/nemotron-asr-finetune/finetune-kor-nemotron-asr
+docker build -f Dockerfile.dgx -t nemotron-asr-dgx:latest .
+```
+
+### 학습 실행 명령 (확정됨)
+
+```bash
+docker run --rm --gpus all --shm-size=64g --ulimit memlock=-1 --ipc=host \
+  -v /root/nemotron-asr-finetune:/workspace \
   -e WORKSPACE=/workspace \
+  -e NEMO_DIR=/opt/NeMo \
+  -e HF_CKPT=/workspace/data/base_model/nemotron-3.5-asr-streaming-0.6b.nemo \
   -e HF_TOKEN="hf_..." \
   -e DATASETS_AUDIO_BACKEND=soundfile \
-  nvcr.io/nvidia/nemo:latest \
-  bash
+  -e SKIP_SETUP_INSTALL=1 \
+  nemotron-asr-dgx:latest \
+  python3 /workspace/finetune-kor-nemotron-asr/scripts/train_pipeline.py
 ```
 
-**호스트 사전 준비:**
-```bash
-mkdir -p /raid/workspace /raid/hf_cache
-```
+**VLLM 조율 필수**: DGX에 DeepSeek-V4-Flash VLLM 서비스(`deepseek-v4-flash` 컨테이너)가 상시 실행 중이며 GPU 97%를 점유. 학습 전 서비스 담당자와 일정 조율 후 `docker stop deepseek-v4-flash` 필요.
 
 **컨테이너 내부 경로 구조:**
 ```
-/workspace/                                          ← WORKSPACE 루트
-├── finetune-kor-nemotron-asr/                       ← 이 repo (git clone)
-├── data/base_model/nemotron-3.5-asr-streaming-0.6b.nemo
-├── NeMo/                                            ← setup_dgx.sh이 필요 시 clone
-├── .setup_dgx_done                                  ← sentinel (idempotent)
-└── probe_results.txt                                ← probe 출력
-
-/root/.cache/huggingface/                            ← HF 캐시 (재다운 방지)
+/opt/NeMo/              ← NeMo git main (이미지에 고정, PYTHONPATH=/opt/NeMo)
+/workspace/             ← 호스트 /root/nemotron-asr-finetune 마운트
+├── finetune-kor-nemotron-asr/    ← 이 repo
+├── data/
+│   ├── base_model/nemotron-3.5-asr-streaming-0.6b.nemo
+│   ├── processed/       ← 변환된 WAV + manifest JSON
+│   └── wav_cache/       ← MP3→WAV 캐시
+└── checkpoints/         ← 학습 체크포인트
 ```
 
-**컨테이너 진입 후 첫 실행 순서:**
-```bash
-git clone <repo> /workspace/finetune-kor-nemotron-asr
-cd /workspace/finetune-kor-nemotron-asr
+**핵심 환경 변수:**
+- `NEMO_DIR=/opt/NeMo` — 이미지에 포함된 NeMo main 경로
+- `SKIP_SETUP_INSTALL=1` — 이미지에서 pip install 생략 (nemo_toolkit 다운그레이드 방지)
+- `DATASETS_AUDIO_BACKEND=soundfile` — torchcodec aarch64 미지원 우회
+- `HOLD_OUT_N=10` — 스모크 테스트 시 필수 (SMOKE_N < HOLD_OUT_N 기본값 1000이면 val=0)
 
-# 베이스 모델 다운로드 (최초 1회)
-mkdir -p /workspace/data/base_model
-huggingface-cli download nvidia/nemotron-3.5-asr-streaming-0.6b \
-  nemotron-3.5-asr-streaming-0.6b.nemo \
-  --local-dir /workspace/data/base_model/
-
-# 환경 프로파일링 (패치 전)
-bash scripts/probe_dgx_environment.sh
-```
-
-**플래그 설명:**
-- `--shm-size=64g` — NeMo DataLoader shared memory 요구
-- `--ipc=host` — 멀티프로세스 DataLoader 필요
-- `-v /raid/workspace:/workspace` — DGX NVMe RAID → 컨테이너 workspace
-- `-v /raid/hf_cache:/root/.cache/huggingface` — HF 캐시 영속화
+**verify 결과:** `bash scripts/verify_on_dgx.sh` → 9/9 PASS (2026-06-20)
 
 ---
 
-## 4. 패치 재분류 (RunPod 9개 → DGX 필요 여부)
+## 4. 패치 재분류 (RunPod 9개 → DGX 실측)
 
-RunPod `setup_environment.sh`의 각 패치를 DGX Station에서 재검증한다.
+`nemotron-asr-dgx:latest` 이미지 기준 실측 결과 (2026-06-20).
 
-| # | 패치 | RunPod 필요 이유 | DGX 예상 상태 | 검증 방법 |
+| # | 패치 | RunPod 필요 이유 | DGX 실측 결과 | 처리 방식 |
 |---|------|-----------------|---------------|-----------|
-| 1 | Numba PTX 다운그레이드 (8.7→8.4) | CUDA toolkit 12.8 vs driver 12.4 불일치 | **불필요** (toolkit/driver 일치) | 패치 없이 학습 스텝 실행 |
-| 2 | nv_one_logger stub | NGC PyPI 미포함 | **불필요** (NGC 컨테이너 포함 추정) | `python3 -c "import nv_one_logger"` |
-| 3 | Prompt model 파일 복사 | NeMo 2.7.3 pip 미포함 | **조건부** (NGC NeMo 버전에 따라) | `import EncDecRNNTBPEModelWithPrompt` |
-| 4 | NeMo main 클론 + PYTHONPATH | pip vs main 불일치 | **조건부** (NGC 최신이면 불필요) | config YAML 로드 성공 여부 |
-| 5 | WarpRNNT GPU 체크 | sm_89 커널 컴파일 | **필요 (변경)** (sm_100 컴파일 확인) | 첫 학습 스텝 |
-| 6 | torchcodec 설치 | CUDA 버전 커플링 방지 | **조건부** (NGC 포함 가능) | `import torchcodec` |
-| 7 | datasets Audio monkey-patch | soundfile 폴백 | **필요 가능성 높음** | `import datasets; ds.cast_column(Audio())` |
-| 8 | Critical import 검증 | 파이프라인 전 검증 | **필요** (목록만 업데이트) | 동일 방식 |
-| 9 | .nemo 모델 존재 확인 | 환경 완결성 | **필요** | 동일 방식 |
+| 1 | Numba PTX 다운그레이드 (8.7→8.4) | CUDA toolkit 12.8 vs driver 12.4 불일치 | **NOT_NEEDED** (SM 10.3 ≥ 10, skip 로직 작동) | `train_pipeline.py` `_sm_major >= 10` 조건 자동 skip |
+| 2 | nv_one_logger stub | PyPI 미포함 | **NEEDED** (pytorch NGC에도 미포함) | `Dockerfile.dgx`에서 `one_logger_callback.py` stub으로 교체 |
+| 3 | Prompt model 파일 복사 | NeMo 2.7.3 pip 미포함 | **NEEDED** (NGC NeMo 컨테이너 방식 포기; NeMo git main 사용) | `Dockerfile.dgx`에서 `/opt/NeMo`에 NeMo git main 클론 |
+| 4 | NeMo main 클론 + PYTHONPATH | pip vs main 불일치 | **NEEDED** (동일) | `PYTHONPATH=/opt/NeMo`, `SKIP_SETUP_INSTALL=1`로 재클론 방지 |
+| 5 | WarpRNNT GPU 체크 | sm_89 커널 컴파일 | **TBD** (VLLM 점유로 첫 학습 스텝 미달성) | 학습 재시작 후 확인 |
+| 6 | torchcodec 설치 | CUDA 버전 커플링 방지 | **NOT_NEEDED** (aarch64 `libtorchcodec_core4.so` 로드 실패) | `Dockerfile.dgx`에서 제외; `DATASETS_AUDIO_BACKEND=soundfile` 사용 |
+| 7 | datasets Audio monkey-patch | soundfile 폴백 | **NEEDED** (env var 방식으로 대체) | `DATASETS_AUDIO_BACKEND=soundfile` 환경 변수 |
+| 8 | Critical import 검증 | 파이프라인 전 검증 | **PASS** (9/9 verify 통과) | `verify_on_dgx.sh` 9/9 PASS 확인 |
+| 9 | .nemo 모델 존재 확인 | 환경 완결성 | **PASS** | `/workspace/data/base_model/` 확인 완료 |
 
-> **결과 기록**: 각 항목을 실행 후 `NEEDED` / `NOT_NEEDED` / `MODIFIED` 로 표시.
+**smoke test 진행 결과 (SMOKE_N=100, HOLD_OUT_N=10)**:
+- Step 1-5 (Setup → Tokenizer): PASS
+- Step 6 (Fine-Tuning): **FAIL** — `torch.OutOfMemoryError: CUDA out of memory` (DeepSeek-V4-Flash VLLM이 GPU 277 GiB 점유)
+- Issue #15799 (checkpoint save failure): **미검증** (OOM으로 미달성)
+
+> **WarpRNNT sm_103 커널 컴파일 여부**: 첫 학습 스텝 완료 후 확인 예정 (VLLM 서비스 중단 후 재시도).
 
 ---
 
-## 5. 환경 셋업 전략
+## 5. 환경 셋업 전략 (확정됨)
 
-### 접근 방식
-NGC 컨테이너가 많은 것을 포함하므로, **최소 개입 원칙**: 필요한 패치만 적용.
+### 접근 방식: Dockerfile 기반 immutable 이미지
+
+NGC 컨테이너 대신 `Dockerfile.dgx`로 모든 패치를 이미지에 고정.
+`setup_dgx.sh`/`probe_dgx_environment.sh`는 Dockerfile 빌드 과정에서 대체됨 (이미지가 진실).
 
 ```bash
-# DGX Station 진입 (컨테이너 실행)
-docker run --gpus all -it --rm \
-  -v /raid/workspace:/workspace \
-  nvcr.io/nvidia/nemo:latest \
-  bash
+# 1. 이미지 빌드 (한 번만)
+cd /root/nemotron-asr-finetune/finetune-kor-nemotron-asr
+docker build -f Dockerfile.dgx -t nemotron-asr-dgx:latest .
 
-# 프로젝트 클론
-git clone <repo> /workspace/finetune-kor-nemotron-asr
-cd /workspace/finetune-kor-nemotron-asr
+# 2. 베이스 모델 다운로드 (한 번만)
+docker run --rm \
+  -v /root/nemotron-asr-finetune:/workspace \
+  -e HF_TOKEN="hf_..." \
+  nemotron-asr-dgx:latest \
+  bash -c "mkdir -p /workspace/data/base_model && \
+    hf download nvidia/nemotron-3.5-asr-streaming-0.6b \
+      nemotron-3.5-asr-streaming-0.6b.nemo \
+      --local-dir /workspace/data/base_model/"
 
-# Phase 0: 환경 프로파일링 (패치 전)
-bash scripts/probe_dgx_environment.sh   # 신규 작성 필요 (§7 참조)
+# 3. verify (9/9 PASS 확인 후 학습 진입)
+docker run --rm --gpus all \
+  -v /root/nemotron-asr-finetune:/workspace \
+  -e WORKSPACE=/workspace -e NEMO_DIR=/opt/NeMo \
+  -e HF_CKPT=/workspace/data/base_model/nemotron-3.5-asr-streaming-0.6b.nemo \
+  nemotron-asr-dgx:latest \
+  bash /workspace/finetune-kor-nemotron-asr/scripts/verify_on_dgx.sh
 ```
 
 ### setup_environment.sh 수정 전략
-- 기존 `setup_environment.sh`를 수정하지 않음
-- DGX 전용 `scripts/setup_dgx.sh`를 신규 작성
-- 패치 재분류 결과를 반영
+- 기존 `setup_environment.sh`/`verify_on_pod.sh` 건드리지 않음 (RunPod 재현성 보존)
+- DGX는 `Dockerfile.dgx` + `verify_on_dgx.sh`로 독립 관리
 
 ---
 
@@ -189,13 +171,15 @@ bash scripts/probe_dgx_environment.sh   # 신규 작성 필요 (§7 참조)
 |----------|--------|-------------|------|
 | `trainer.devices` | `1` | `1` | 단일 GPU 검증 우선 |
 | `trainer.precision` | `bf16` | `bf16` | 유지 |
-| `model.train_ds.batch_duration` | `100` | `500` (시작점) | HBM3e 192GB, 단계적 증가 |
+| `model.train_ds.batch_duration` | `100` | `500` (시작점) | 276.5 GiB VRAM, 단계적 증가 |
 | `model.train_ds.max_duration` | `20` | `20` | 유지 |
-| `exp_manager.exp_dir` | `/workspace/data/checkpoints` | `/raid/checkpoints` 또는 DGX 로컬 NVMe |
+| `exp_manager.exp_dir` | `/workspace/data/checkpoints` | `/workspace/checkpoints` (호스트: `/root/nemotron-asr-finetune/checkpoints`) |
 
-### batch_duration 탐색 계획
+> **VLLM 조율 전제**: DeepSeek-V4-Flash VLLM 서비스(`deepseek-v4-flash` 컨테이너, `docker-compose` 관리)가 GPU 97% 점유. batch_duration 탐색 전 서비스 담당자 확인 후 `docker compose -f <경로> down`으로 중단 필요.
+
+### batch_duration 탐색 계획 (Task 7, VLLM 중단 후 실행)
 ```
-100  → L40S 검증값 (기준점)
+100  → 기준점 (L40S 검증값, WarpRNNT sm_103 커널 확인도 겸함)
 500  → 첫 시도
 1000 → 성공 시
 2000 → 성공 시
@@ -290,12 +274,13 @@ OOM → 이진 탐색으로 최대값 확정
 
 | 리스크 | 가능성 | 대응 |
 |--------|--------|------|
-| WarpRNNT sm_100 미지원 | 중간 | NeMo 업스트림 이슈 확인, CUDA 재컴파일 |
-| NGC 컨테이너 aarch64 미지원 | 낮음 | pytorch NGC 컨테이너 + NeMo 수동 설치 fallback |
-| `EncDecRNNTBPEModelWithPrompt` NGC 미포함 | 중간 | NeMo main clone + PYTHONPATH (RunPod 방식 유지) |
-| Numba aarch64 호환 문제 | 낮음 | Numba >= 0.60 (aarch64 공식 지원) |
-| 통합 메모리(NVLink-C2C)에서 batch_duration OOM 예측 불확실 | 중간 | 단계적 탐색으로 확정 |
-| `ko-KR` prompt locale 미지원 | 낮음 | Phase 1에서 확인 → 미지원 시 nearest 아시아 locale(ja-JP/zh-CN) 슬롯 사용 (타 언어 사례 참조) |
+| **DeepSeek-V4-Flash VLLM 서비스 스케줄 충돌** | **높음 (실제 발생)** | 서비스 담당자와 학습 일정 조율; `docker compose -f <경로> down` 후 실행 |
+| WarpRNNT sm_103 미지원 | 중간 | NeMo 업스트림 이슈 확인; VLLM 중단 후 첫 스텝에서 확인 |
+| Issue #15799 (checkpoint save failure) | 중간 | 첫 학습 완료 후 체크포인트 존재 여부 확인; 실패 시 NeMo 이슈 추적 |
+| `EncDecRNNTBPEModelWithPrompt` NeMo 버전 변경 | 낮음 | `Dockerfile.dgx`에서 `--depth 1 --branch main` 고정; 재빌드로 업데이트 가능 |
+| NeMo git main 불안정 (depth=1) | 낮음 | 특정 커밋 pin (`ARG NEMO_COMMIT=<sha>`)으로 고정 가능 |
+| Numba aarch64 호환 문제 | **NOT_NEEDED** (SM 10.3 자동 skip) | 해결됨 |
+| `ko-KR` prompt locale 미지원 | 낮음 | tokenizer 검증(Step 5) PASS — 지원 확인됨 |
 
 ---
 

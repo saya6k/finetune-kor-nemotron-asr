@@ -150,7 +150,7 @@ python ${NEMO_DIR}/examples/asr/speech_to_text_finetune.py \
 - `limit_train_batches` — **never set** (NeMo Issue #15782: silently limits data per epoch)
 - `max_steps` — **do not combine with max_epochs** (PyTorch Lightning stops at whichever triggers first)
 - `batch_duration=100` — proven max for L40S 48GB (200 causes OOM risk, 400 crashes)
-- `d_model=1024` — explicit; OmegaConf can't resolve `${model.encoder.d_model}` at scheduler init
+- `d_model=1024` — **NeMo 2.x only** (RunPod). NeMo 2.x config references `${model.encoder.d_model}`; must override. **NeMo 3.x** (DGX): `WarmupAnnealHoldPolicy` rejects `d_model` → use `~model.optim.sched.d_model` (Hydra delete) to remove from .nemo embedded config. `train_pipeline.py` handles this automatically via `_nemo_major()` version check.
 - `warmup_steps=null` — must be null when using warmup_ratio
 - Checkpoint output path: `$CHECKPOINT_DIR/FastConformer-Transducer-BPE-Prompt-Streaming/...`
 
