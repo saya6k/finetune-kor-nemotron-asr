@@ -171,6 +171,8 @@ def setup() -> Dict:
     else:
         logger.info("SKIP_SETUP_INSTALL=1 — pre-built image, skipping pip installs")
 
+    py_ver = f'python{sys.version_info.major}.{sys.version_info.minor}'
+
     if not NEMO_DIR.exists():
         logger.info(f"NeMo main 클론 중... {NEMO_DIR}")
         subprocess.run(['git', 'clone', '--depth', '1',
