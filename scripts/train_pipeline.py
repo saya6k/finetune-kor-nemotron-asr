@@ -44,12 +44,18 @@ logger = logging.getLogger('train_pipeline')
 WORKSPACE = Path(os.environ.get('WORKSPACE', '/workspace'))
 DATA_DIR = Path(os.environ.get('DATA_DIR', str(WORKSPACE / 'data')))
 NEMO_DIR = Path(os.environ.get('NEMO_DIR', str(WORKSPACE / 'NeMo')))
-BATCH_DURATION = int(os.environ.get('BATCH_DURATION', '100'))  # 100 proven on L40S 48GB
-MAX_EPOCHS = int(os.environ.get('MAX_EPOCHS', '3'))
+BATCH_DURATION = int(os.environ.get('BATCH_DURATION', '5000'))  # 5000 proven on GB300 276GiB (7000+ OOM)
+MAX_EPOCHS = int(os.environ.get('MAX_EPOCHS', '20'))  # ceiling; early stopping decides actual stop
 SMOKE_N = int(os.environ.get('SMOKE_N', '0'))  # 0 = 전체 데이터 (unlimited)
 HOLD_OUT_N = int(os.environ.get('HOLD_OUT_N', '1000'))
 TEST_HOLD_OUT_N = 500
 HF_REPO_ID = os.environ.get('HF_REPO_ID', 'saya6k/nemotron-kor-checkpoints')
+# Checkpoint every N steps. save_top_k=-1 keeps ALL checkpoints for full sweep eval.
+# val_check_interval is aligned so val_wer exists at each checkpoint step.
+CKPT_EVERY_N_STEPS = int(os.environ.get('CKPT_EVERY_N_STEPS', '500'))
+# Local dataset dir (set after hf download). Empty = stream from HuggingFace.
+# Expected layout: $EMILIA_LOCAL_DIR/Emilia-YODAS/KO/*.tar  (and EN/JA/ZH)
+EMILIA_LOCAL_DIR = os.environ.get('EMILIA_LOCAL_DIR', '')
 
 # Audio backend (avoid torchcodec CUDA mismatch)
 os.environ["DATASETS_AUDIO_BACKEND"] = "soundfile"
@@ -285,48 +291,100 @@ def setup() -> Dict:
 # ║  STEP 2: DATA INGEST (stream-to-file)                              ║
 # ╚═════════════════════════════════════════════════════════════════════╝
 
+FAST_INGEST_WORKERS = int(os.environ.get('FAST_INGEST_WORKERS', '32'))
+
+
+def _run_fast_ingest(emilia_lang_dir: str, wav_cache: str, output: str,
+                     lang_tag: str, max_shards: int = 0,
+                     max_entries: int = 0) -> int:
+    """Run fast_ingest.py as a subprocess. Returns number of entries written."""
+    script = str(Path(__file__).resolve().parent / 'fast_ingest.py')
+    cmd = [
+        sys.executable, script,
+        '--emilia-dir', emilia_lang_dir,
+        '--wav-cache', wav_cache,
+        '--output', output,
+        '--lang', lang_tag,
+        '--workers', str(FAST_INGEST_WORKERS),
+    ]
+    if max_shards > 0:
+        cmd += ['--max-shards', str(max_shards)]
+    if max_entries > 0:
+        cmd += ['--max-entries', str(max_entries)]
+    logger.info(f"fast_ingest: {emilia_lang_dir} → {output}  (workers={FAST_INGEST_WORKERS})")
+    result = subprocess.run(cmd, check=True)
+    n = sum(1 for line in open(output) if line.strip()) if os.path.exists(output) else 0
+    logger.info(f"  → {n} entries")
+    return n
+
+
 def data_ingest() -> Tuple[str, int]:
     """
-    Stream Emilia-YODAS Korean samples and write directly to a temp manifest file.
+    Convert Emilia-YODAS KO TAR files to WAV + write manifest (parallel via fast_ingest).
+
+    When EMILIA_LOCAL_DIR is set, uses fast_ingest.py subprocess (32 workers → ~5-10 min
+    for 208 TARs). Otherwise falls back to sequential HuggingFace streaming.
     Returns (temp_manifest_path, total_entries_written).
     """
+    temp_path = PROCESSED_DIR / '_temp_ingest_ko.jsonl'
+
+    # Resume: skip if already done (check line count vs SMOKE_N)
+    if temp_path.exists():
+        existing_n = sum(1 for line in open(temp_path) if line.strip())
+        if SMOKE_N > 0 and existing_n >= SMOKE_N:
+            logger.info(f"Reusing existing temp manifest ({existing_n} entries, SMOKE_N={SMOKE_N})")
+            return str(temp_path), existing_n
+        if SMOKE_N == 0 and existing_n > 10000:
+            logger.info(f"Reusing existing temp manifest ({existing_n} entries, full run)")
+            return str(temp_path), existing_n
+
+    if EMILIA_LOCAL_DIR:
+        ko_dir = f"{EMILIA_LOCAL_DIR}/Emilia-YODAS/KO"
+        max_shards = 0  # all TARs
+        if SMOKE_N > 0:
+            # Rough estimate: ~16k entries per TAR → 1 TAR per SMOKE_N/16000 shards
+            max_shards = max(1, SMOKE_N // 16000 + 1)
+        n = _run_fast_ingest(ko_dir, str(WAV_CACHE_DIR), str(temp_path),
+                             'ko-KR', max_shards=max_shards)
+        if SMOKE_N > 0 and n > SMOKE_N:
+            # Trim to SMOKE_N
+            with open(temp_path) as f:
+                lines = [l for l in f if l.strip()]
+            with open(temp_path, 'w') as f:
+                f.writelines(lines[:SMOKE_N])
+            n = SMOKE_N
+        return str(temp_path), n
+
+    # Fallback: sequential streaming (no local TAR dir)
     import soundfile as sf
     import librosa
     from datasets import load_dataset
-    _patch_datasets_audio()  # apply after datasets is available
+    _patch_datasets_audio()
 
-    logger.info("Emilia-YODAS Korean streaming 시작 (stream-to-file)...")
+    logger.info("Emilia-YODAS Korean streaming 시작 (sequential fallback)...")
     logger.info(f"  SMOKE_N: {SMOKE_N}")
 
     ds = load_dataset(
         "amphion/Emilia-Dataset",
         data_files={"train": "Emilia-YODAS/KO/**/*.tar"},
         split="train",
-        streaming=True
+        streaming=True,
     )
 
-    temp_path = PROCESSED_DIR / '_temp_ingest_ko.jsonl'
     entries_written = 0
-    skipped_text = 0
-    wav_cache_hits = 0
-
     with open(temp_path, 'w', encoding='utf-8') as f:
         for sample in ds:
-            # Emilia-YODAS structure: json.text + mp3 (24kHz MP3 audio)
             meta = sample.get('json', {})
             text = meta.get('text', '').strip()
             if not text:
-                skipped_text += 1
                 continue
 
-            # WAV conversion (with cache)
             audio = sample['mp3']
             sample_id = meta.get('_id', sample.get('__key__', str(abs(hash(text)))))
             wav_filename = f"ko_{sample_id}.wav".replace('/', '_')
             wav_path = WAV_CACHE_DIR / wav_filename
 
             if wav_path.exists():
-                wav_cache_hits += 1
                 duration = librosa.get_duration(path=str(wav_path))
             else:
                 audio_array = audio['array']
@@ -336,32 +394,22 @@ def data_ingest() -> Tuple[str, int]:
                 sf.write(str(wav_path), audio_array, 16000)
                 duration = len(audio_array) / 16000
 
-            entry = {
+            f.write(json.dumps({
                 "audio_filepath": str(wav_path),
                 "duration": round(duration, 3),
                 "text": text,
                 "lang": "ko-KR",
                 "target_lang": "ko-KR",
-            }
-            f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+            }, ensure_ascii=False) + '\n')
             entries_written += 1
-
-            if entries_written % 1000 == 0:
+            if entries_written % 5000 == 0:
                 logger.info(f"  {entries_written} entries written...")
-
             if SMOKE_N > 0 and entries_written >= SMOKE_N:
-                logger.info(f"SMOKE_N={SMOKE_N} 도달, 처리 중단")
                 break
 
-    # Force garbage collection (tar buffers)
     del ds
     gc.collect()
-
     logger.info(f"Data ingest 완료: {entries_written} entries")
-    logger.info(f"  WAV 캐시 히트: {wav_cache_hits}")
-    logger.info(f"  빈 텍스트 스킵: {skipped_text}")
-    logger.info(f"  Temp file: {temp_path}")
-
     return str(temp_path), entries_written
 
 
@@ -416,33 +464,47 @@ def build_manifests(temp_path: str) -> Dict[str, str]:
     write_manifest('test_emilia_holdout_ko', test_holdout_entries,
                    str(PROCESSED_DIR / 'test_emilia_holdout_ko.json'))
 
-    # FLEURS Korean eval
-    logger.info("FLEURS Korean eval manifest 생성 중...")
-    try:
+    # FLEURS eval manifests (KO + FR + DE + RU)
+    # RU is not in training data — used to measure catastrophic forgetting.
+    def _build_fleurs_manifest(locale: str, lang_tag: str, key: str):
         from datasets import load_dataset
         import librosa, soundfile as sf
-        fleurs_ds = load_dataset("google/fleurs", "ko_kr", split="test")
-        fleurs_entries = []
-        for sample in fleurs_ds:
-            audio = sample['audio']
-            wav_path = str(WAV_CACHE_DIR / f"fleurs_{sample['id']}.wav")
-            audio_array = audio['array']
-            sr = audio['sampling_rate']
-            if sr != 16000:
-                audio_array = librosa.resample(audio_array, orig_sr=sr, target_sr=16000)
-            sf.write(wav_path, audio_array, 16000)
-            fleurs_entries.append({
-                "audio_filepath": wav_path,
-                "duration": round(len(audio_array) / 16000, 3),
-                "text": sample['transcription'].strip(),
-                "lang": "ko-KR",
-                "target_lang": "ko-KR"
-            })
-        write_manifest('test_fleurs_ko', fleurs_entries,
-                       str(PROCESSED_DIR / 'test_fleurs_ko.json'))
-    except Exception as e:
-        logger.warning(f"FLEURS manifest 실패: {e}")
-        manifests['test_fleurs_ko'] = None
+        out = str(PROCESSED_DIR / f'{key}.json')
+        if os.path.exists(out):
+            logger.info(f"  {key}: already cached at {out}")
+            manifests[key] = out
+            return
+        logger.info(f"  {key} ({locale}) manifest 생성 중...")
+        try:
+            ds = load_dataset("google/fleurs", locale, split="test")
+            entries = []
+            for sample in ds:
+                audio = sample['audio']
+                wav_path = str(WAV_CACHE_DIR / f"fleurs_{locale}_{sample['id']}.wav")
+                arr = audio['array']
+                sr = audio['sampling_rate']
+                if sr != 16000:
+                    arr = librosa.resample(arr, orig_sr=sr, target_sr=16000)
+                sf.write(wav_path, arr, 16000)
+                entries.append({
+                    "audio_filepath": wav_path,
+                    "duration": round(len(arr) / 16000, 3),
+                    "text": sample['transcription'].strip(),
+                    "lang": lang_tag,
+                    "target_lang": lang_tag,
+                })
+            write_manifest(key, entries, out)
+        except Exception as e:
+            logger.warning(f"{key} manifest 실패: {e}")
+            manifests[key] = None
+
+    for locale, lang_tag, key in [
+        ("ko_kr", "ko-KR", "test_fleurs_ko"),
+        ("fr_fr", "fr-FR", "test_fleurs_fr"),
+        ("de_de", "de-DE", "test_fleurs_de"),
+        ("ru_ru", "ru-RU", "test_fleurs_ru"),  # catastrophic-forgetting probe
+    ]:
+        _build_fleurs_manifest(locale, lang_tag, key)
 
     # Zeroth Korean eval (requires manual download to data/raw/zeroth/)
     zeroth_dir = DATA_DIR / 'raw' / 'zeroth'
@@ -492,8 +554,10 @@ def language_mix(manifests: Dict[str, str]) -> str:
     lang_mix = {
         "ko": float(os.environ.get('LANG_MIX_KO', '0.80')),
         "en": float(os.environ.get('LANG_MIX_EN', '0.10')),
-        "ja": float(os.environ.get('LANG_MIX_JA', '0.05')),
-        "zh": float(os.environ.get('LANG_MIX_ZH', '0.05')),
+        "ja": float(os.environ.get('LANG_MIX_JA', '0.04')),
+        "zh": float(os.environ.get('LANG_MIX_ZH', '0.04')),
+        "fr": float(os.environ.get('LANG_MIX_FR', '0.01')),
+        "de": float(os.environ.get('LANG_MIX_DE', '0.01')),
     }
     assert abs(sum(lang_mix.values()) - 1.0) < 0.01, f"Sum={sum(lang_mix.values())}"
 
@@ -515,10 +579,17 @@ def language_mix(manifests: Dict[str, str]) -> str:
     logger.info(f"Language Mix: ko={n_ko} ({lang_mix['ko']:.0%}), "
                 f"other={other_total} ({1-lang_mix['ko']:.0%})")
 
+    def _emilia_pattern(lang: str) -> str:
+        if EMILIA_LOCAL_DIR:
+            return f"{EMILIA_LOCAL_DIR}/Emilia-YODAS/{lang}/**/*.tar"
+        return f"Emilia-YODAS/{lang}/**/*.tar"
+
     other_langs = [
-        ("en", "Emilia-YODAS/EN/**/*.tar", "en-US"),
-        ("ja", "Emilia-YODAS/JA/**/*.tar", "ja-JP"),
-        ("zh", "Emilia-YODAS/ZH/**/*.tar", "zh-CN"),
+        ("en", _emilia_pattern("EN"), "en-US"),
+        ("ja", _emilia_pattern("JA"), "ja-JP"),
+        ("zh", _emilia_pattern("ZH"), "zh-CN"),
+        ("fr", _emilia_pattern("FR"), "fr-FR"),
+        ("de", _emilia_pattern("DE"), "de-DE"),
     ]
 
     mixed_entries = list(ko_entries)
@@ -528,61 +599,76 @@ def language_mix(manifests: Dict[str, str]) -> str:
         target_n = int(other_total * lang_mix[lang_code] / (1 - lang_mix["ko"]))
         logger.info(f"  {lang_code} 로드 중 (목표: {target_n})...")
 
-        try:
-            other_ds = load_dataset(
-                "amphion/Emilia-Dataset",
-                data_files={"train": data_pattern},
-                split="train",
-                streaming=True
-            )
+        lang_entries = []
 
-            lang_entries = []
-            for sample in other_ds:
-                if len(lang_entries) >= target_n + 500:
-                    break
-                meta = sample.get('json', {})
-                text = meta.get('text', '').strip()
-                if not text:
-                    continue
+        # Fast path: local TAR files → parallel ingest
+        if EMILIA_LOCAL_DIR:
+            lang_upper = lang_code.upper()
+            lang_dir = f"{EMILIA_LOCAL_DIR}/Emilia-YODAS/{lang_upper}"
+            if os.path.isdir(lang_dir):
+                lang_temp = str(PROCESSED_DIR / f'_temp_ingest_{lang_code}.jsonl')
+                cached_eval = str(PROCESSED_DIR / f'test_mixed_{lang_code}.json')
+                if not os.path.exists(lang_temp) or \
+                        sum(1 for _ in open(lang_temp) if _.strip()) < target_n // 2:
+                    # Estimate shards needed: ~16k entries/TAR
+                    needed_shards = max(1, (target_n + 500) // 16000 + 2)
+                    _run_fast_ingest(lang_dir, str(WAV_CACHE_DIR), lang_temp,
+                                     lang_tag, max_shards=needed_shards)
+                with open(lang_temp) as f:
+                    lang_entries = [json.loads(l) for l in f if l.strip()]
+            else:
+                logger.warning(f"  {lang_dir} not found, skipping {lang_code}")
 
-                audio = sample['mp3']
-                sample_id = meta.get('_id', sample.get('__key__', str(abs(hash(text)))))
-                wav_filename = f"{lang_code}_{sample_id}.wav".replace('/', '_')
-                wav_path = WAV_CACHE_DIR / wav_filename
+        # Fallback: sequential HF streaming
+        if not lang_entries:
+            try:
+                other_ds = load_dataset(
+                    "amphion/Emilia-Dataset",
+                    data_files={"train": data_pattern},
+                    split="train",
+                    streaming=True
+                )
+                for sample in other_ds:
+                    if len(lang_entries) >= target_n + 500:
+                        break
+                    meta = sample.get('json', {})
+                    text = meta.get('text', '').strip()
+                    if not text:
+                        continue
+                    audio = sample['mp3']
+                    sample_id = meta.get('_id', sample.get('__key__', str(abs(hash(text)))))
+                    wav_filename = f"{lang_code}_{sample_id}.wav".replace('/', '_')
+                    wav_path = WAV_CACHE_DIR / wav_filename
+                    if not wav_path.exists():
+                        audio_array = audio['array']
+                        sr = audio['sampling_rate']
+                        if sr != 16000:
+                            audio_array = librosa.resample(audio_array, orig_sr=sr, target_sr=16000)
+                        sf.write(str(wav_path), audio_array, 16000)
+                    duration = librosa.get_duration(path=str(wav_path))
+                    lang_entries.append({
+                        "audio_filepath": str(wav_path),
+                        "duration": round(duration, 3),
+                        "text": text,
+                        "lang": lang_tag,
+                        "target_lang": lang_tag,
+                    })
+            except Exception as e:
+                logger.warning(f"  {lang_code} 로드 실패: {e}")
 
-                if not wav_path.exists():
-                    audio_array = audio['array']
-                    sr = audio['sampling_rate']
-                    if sr != 16000:
-                        audio_array = librosa.resample(audio_array, orig_sr=sr, target_sr=16000)
-                    sf.write(str(wav_path), audio_array, 16000)
-
-                duration = librosa.get_duration(path=str(wav_path))
-                lang_entries.append({
-                    "audio_filepath": str(wav_path),
-                    "duration": round(duration, 3),
-                    "text": text,
-                    "lang": lang_tag,
-                    "target_lang": lang_tag,
-                })
-
+        if lang_entries:
             mixed_entries.extend(lang_entries[:target_n])
             if len(lang_entries) > target_n:
                 eval_entries = lang_entries[target_n:target_n + 500]
                 eval_path = str(PROCESSED_DIR / f'test_mixed_{lang_code}.json')
-                with open(eval_path, 'w', encoding='utf-8') as fe:
+                if not os.path.exists(eval_path):
+                  with open(eval_path, 'w', encoding='utf-8') as fe:
                     for e in eval_entries:
                         fe.write(json.dumps(e, ensure_ascii=False) + '\n')
                 eval_other[f"mixed_{lang_code}"] = eval_path
 
             logger.info(f"    {len(lang_entries[:target_n])} entries + "
                         f"{min(500, max(0, len(lang_entries)-target_n))} eval")
-
-            del other_ds
-            gc.collect()
-
-        except Exception as e:
-            logger.warning(f"  {lang_code} 로드 실패: {e}")
 
     # Shuffle and write mixed manifest
     random.shuffle(mixed_entries)
@@ -726,9 +812,12 @@ def train(hf_ckpt: str, mixed_manifest: str, val_manifest: str) -> int:
         '++exp_manager.resume_ignore_no_checkpoint=true',
         '++exp_manager.create_early_stopping_callback=true',
         '++exp_manager.early_stopping_callback_params.monitor=val_wer',
-        '++exp_manager.early_stopping_callback_params.patience=5',
-        '++exp_manager.checkpoint_callback_params.save_top_k=3',
+        '++exp_manager.early_stopping_callback_params.patience=10',
+        '++exp_manager.checkpoint_callback_params.save_top_k=-1',
         '++exp_manager.checkpoint_callback_params.monitor=val_wer',
+        '++exp_manager.checkpoint_callback_params.save_last=true',
+        f'++exp_manager.checkpoint_callback_params.every_n_train_steps={CKPT_EVERY_N_STEPS}',
+        f'++trainer.val_check_interval={CKPT_EVERY_N_STEPS}',
     ]
 
     logger.info(f"Command: {' '.join(cmd[:3])} ... (truncated)")
@@ -799,8 +888,12 @@ def eval_sweep(manifests: Dict[str, str]) -> str:
             eval_datasets[key] = path
 
     # Filter: keep only our 6 eval datasets
-    desired = {'val_emilia_holdout_ko', 'test_emilia_holdout_ko', 'test_fleurs_ko',
-               'test_zeroth_ko', 'mixed_en', 'mixed_ja', 'mixed_zh'}
+    desired = {
+        'val_emilia_holdout_ko', 'test_emilia_holdout_ko',
+        'test_fleurs_ko', 'test_fleurs_fr', 'test_fleurs_de', 'test_fleurs_ru',
+        'test_zeroth_ko',
+        'mixed_en', 'mixed_ja', 'mixed_zh', 'mixed_fr', 'mixed_de',
+    }
     eval_datasets = {k: v for k, v in eval_datasets.items()
                      if any(d in k for d in desired) or k in desired}
     # Rename mixed_* to test_mixed_*

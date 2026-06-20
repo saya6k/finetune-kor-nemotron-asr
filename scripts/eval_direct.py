@@ -48,6 +48,93 @@ def patch_prompt_dataloader(fallback_lang: str):
     return True
 
 
+def eval_checkpoint(ckpt_path: str, datasets: dict, device: str = "cuda:0") -> list:
+    """Load checkpoint once, evaluate all datasets, return list of result dicts."""
+    import torch
+    from nemo.collections.asr.models import EncDecRNNTBPEModelWithPrompt
+
+    print(f"\n{'='*60}")
+    print(f"Loading {Path(ckpt_path).name} ...")
+    t0 = time.time()
+    model = EncDecRNNTBPEModelWithPrompt.restore_from(ckpt_path, map_location=device)
+    model = model.to(device)
+    model.eval()
+    print(f"  Loaded in {time.time()-t0:.1f}s")
+
+    results = []
+    for ds_name, manifest_path in datasets.items():
+        if not manifest_path or not os.path.exists(manifest_path):
+            print(f"  SKIP {ds_name}: manifest not found")
+            continue
+        if os.path.getsize(manifest_path) == 0:
+            print(f"  SKIP {ds_name}: empty manifest")
+            continue
+        try:
+            r = _eval_with_model(model, ckpt_path, manifest_path, ds_name, device)
+            results.append(r)
+        except Exception as e:
+            import traceback
+            print(f"  ERROR {ds_name}: {e}")
+            traceback.print_exc()
+
+    del model
+    torch.cuda.empty_cache()
+    return results
+
+
+def _eval_with_model(model, checkpoint_path, manifest_path, ds_name, device="cuda:0"):
+    """Evaluate one dataset against an already-loaded model."""
+    ckpt_name = Path(checkpoint_path).name
+    target_lang = detect_lang(manifest_path)
+    print(f"  [{ds_name}] lang={target_lang}", flush=True)
+
+    data = load_manifest(manifest_path)
+    refs = [e["text"] for e in data]
+    audio_paths = [e["audio_filepath"] for e in data]
+
+    patch_prompt_dataloader(target_lang)
+
+    hyps = []
+    batch_size = 8
+    t1 = time.time()
+    for batch_start in range(0, len(audio_paths), batch_size):
+        batch_end = min(batch_start + batch_size, len(audio_paths))
+        batch = audio_paths[batch_start:batch_end]
+        try:
+            result = model.transcribe(batch, batch_size=len(batch), target_lang=target_lang, verbose=False)
+            hyps.extend(_extract_text(r) for r in result)
+        except Exception as e:
+            print(f"    batch [{batch_start}:{batch_end}] fallback: {e}")
+            for ap in batch:
+                try:
+                    h = model.transcribe([ap], batch_size=1, target_lang=target_lang, verbose=False)[0]
+                except Exception:
+                    h = ""
+                hyps.append(_extract_text(h))
+
+        progress = min(batch_end, len(audio_paths))
+        if progress % 100 == 0 or progress == len(audio_paths):
+            partial_cer = jiwer.cer(refs[:progress], hyps[:progress]) * 100
+            print(f"    [{progress}/{len(audio_paths)}] CER={partial_cer:.2f}%", flush=True)
+
+    elapsed = time.time() - t1
+    cer = jiwer.cer(refs, hyps) * 100
+    wer = jiwer.wer(refs, hyps) * 100
+    ser = sum(1 for r, h in zip(refs, hyps) if r != h) / len(refs) * 100
+    print(f"  [{ds_name}] CER={cer:.2f}% WER={wer:.2f}% ({elapsed:.0f}s)", flush=True)
+
+    return {"checkpoint": ckpt_name, "dataset": ds_name, "cer": cer, "wer": wer,
+            "ser": ser, "num_samples": len(data)}
+
+
+def _extract_text(item):
+    if isinstance(item, str):
+        return item
+    if hasattr(item, "text"):
+        return item.text
+    return str(item)
+
+
 def run_eval(checkpoint_path, manifest_path, ds_name, device="cuda:0"):
     # Restore model once per checkpoint
     print(f"Loading model from {checkpoint_path}...")

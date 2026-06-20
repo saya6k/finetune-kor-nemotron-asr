@@ -8,10 +8,10 @@ Production-grade Korean ASR fine-tuning pipeline for NVIDIA's `nemotron-3.5-asr-
 
 **Key design decisions** (see `SPEC.md` and `plans/jazzy-waddling-dragonfly.md` for rationale):
 - `lr=1e-4` (conservative, preserves pretrained representations)
-- `max_epochs=3` (21,900h exposure from 7,300h data is sufficient)
+- `max_epochs=20` (상한선; 실제 중단은 early stopping이 결정 — patience=10 val checks ≈ 2 epochs)
 - `gradient_clip_val=1.0`, `seed_everything=42`
-- Language mix: ko=80%, en=10%, ja=5%, zh=5% (same Emilia-YODAS dataset)
-- Evaluation: 6 datasets (1 validation + 5 test), CER+WER+SER metrics
+- Language mix: ko=80%, en=10%, ja=4%, zh=4%, fr=1%, de=1% (Emilia-YODAS)
+- Evaluation: 10 datasets (1 validation + 9 test), CER+WER+SER metrics; RU probes forgetting
 - Checkpoint sweep eval across all checkpoints × all datasets
 - Tokenizer reuse with strict verification (coverage ≥ 98%, byte fallback ≤ 2%, UNK ≈ 0%)
 
@@ -92,7 +92,7 @@ finetune-kor-nemotron-asr/
 | `BATCH_DURATION` | Batch size in seconds; reduce if OOM | `100` |
 | `SMOKE_N` | Training samples limit (unset = full dataset) | — (full) |
 | `PYTHONPATH` | Must include NeMo main clone before pip | `/workspace/NeMo` |
-| `MAX_EPOCHS` | Training epochs (1-3 for 7,300h) | `3` |
+| `MAX_EPOCHS` | 상한선 epochs (early stopping이 실제 결정) | `20` |
 | `KOR_DATASET` | Dataset override (`"fleurs"`, `"aihub"`, URL, or path) | — (uses Emilia-YODAS) |
 | `LANG_MIX_RATIO` | Korean ratio in training mix (0.70-0.80) | `0.80` |
 | `TTS_AUGMENT` | Enable TTS augmentation (`"true"`/`"false"`) | `false` |
@@ -120,7 +120,7 @@ python ${NEMO_DIR}/examples/asr/speech_to_text_finetune.py \
   ++model.validation_ds.manifest_filepath="${VAL_MANIFEST}" \
   ++model.tokenizer.dir=${CHECKPOINT_DIR} \
   ++trainer.devices=1 \
-  ++trainer.max_epochs=3 \
+  ++trainer.max_epochs=20 \
   ++trainer.precision=bf16 \
   ++trainer.gradient_clip_val=1.0 \
   ++seed_everything=42 \
@@ -140,9 +140,12 @@ python ${NEMO_DIR}/examples/asr/speech_to_text_finetune.py \
   ++exp_manager.resume_ignore_no_checkpoint=true \
   ++exp_manager.create_early_stopping_callback=true \
   ++exp_manager.early_stopping_callback_params.monitor=val_wer \
-  ++exp_manager.early_stopping_callback_params.patience=5 \
-  ++exp_manager.checkpoint_callback_params.save_top_k=3 \
-  ++exp_manager.checkpoint_callback_params.monitor=val_wer
+  ++exp_manager.early_stopping_callback_params.patience=10 \
+  ++exp_manager.checkpoint_callback_params.save_top_k=-1 \
+  ++exp_manager.checkpoint_callback_params.save_last=true \
+  ++exp_manager.checkpoint_callback_params.every_n_train_steps=500 \
+  ++exp_manager.checkpoint_callback_params.monitor=val_wer \
+  ++trainer.val_check_interval=500
 ```
 
 **Critical constraints**:
@@ -179,11 +182,15 @@ GPU → setup → imports → split logic → training params → eval_direct �
 | # | Name | Usage | Source |
 |---|------|-------|--------|
 | 1 | `val_emilia_holdout_ko` | **Validation** (Early Stopping) | Emilia-YODAS KO hold-out |
-| 2 | `test_fleurs_ko` | Test | FLEURS ko_kr |
+| 2 | `test_fleurs_ko` | Test — primary KO benchmark | FLEURS ko_kr |
 | 3 | `test_emilia_holdout_ko` | Test | Emilia-YODAS KO hold-out B (val과 분리) |
 | 4 | `test_zeroth_ko` | Test | Zeroth Korean |
 | 5 | `test_mixed_en` | Test | Emilia-YODAS EN |
 | 6 | `test_mixed_ja` | Test | Emilia-YODAS JA |
+| 7 | `test_mixed_zh` | Test | Emilia-YODAS ZH |
+| 8 | `test_fleurs_fr` | Test — 학습 언어 WER | FLEURS fr_fr |
+| 9 | `test_fleurs_de` | Test — 학습 언어 WER | FLEURS de_de |
+| 10 | `test_fleurs_ru` | Test — **catastrophic forgetting 프로브** (비학습) | FLEURS ru_ru |
 
 **Model card baseline**: CER 7.12 on FLEURS Korean (1.12s chunk, LangID mode).
 

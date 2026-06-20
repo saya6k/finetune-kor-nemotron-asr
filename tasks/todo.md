@@ -59,11 +59,30 @@ L40S 대비 throughput 비율 계산 및 기록.
 
 ---
 
-## Phase 3: 풀 학습 (Checkpoint C 이후)
+## Phase 2.5: 다운로드 (학습 전 완료 필요)
+
+- [ ] Task 6.7: Emilia-YODAS 로컬 다운로드
+  - [x] KO: 208 TAR 파일 (~210 GB) — 진행 중
+  - [x] EN: 30 샤드 (10% 비율 충족) — 진행 중
+  - [x] JA: 15 샤드 (4% 비율 충족) — EN 완료 후 시작
+  - [x] ZH: 15 샤드 (4% 비율 충족) — JA 완료 후 시작
+  - [ ] FR: 5 샤드 (1% 비율) — **미시작** (EN/JA/ZH 이후 추가 필요)
+  - [ ] DE: 5 샤드 (1% 비율) — **미시작**
+  - `EMILIA_LOCAL_DIR=/workspace/emilia_local` 로 `train_pipeline.py` 사용
+- [ ] Task 6.8: Eval 데이터셋 다운로드
+  - [x] FLEURS ko-KR: 382개 완료
+  - [ ] FLEURS fr-FR: 미완료
+  - [ ] FLEURS de-DE: 미완료
+  - [ ] FLEURS ru-RU: 미완료 (catastrophic forgetting 프로브)
+  - [ ] Zeroth Korean: 진행 중
+
+## Phase 3: 풀 학습 (Phase 2.5 완료 후)
 
 - [ ] Task 8: 3 epoch 학습 + checkpoint sweep
   - [ ] val_wer 감소 추세 확인 (NaN 없음)
   - [ ] CER on FLEURS ko-KR ≤ 7.12
+  - [ ] FLEURS fr-FR, de-DE WER 측정 (학습 언어 성능)
+  - [ ] FLEURS ru-RU WER 측정 (catastrophic forgetting 확인)
   - [ ] RunPod 결과와 비교표 작성
 
 ---
