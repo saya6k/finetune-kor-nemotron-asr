@@ -140,34 +140,36 @@ def setup() -> Dict:
         total_mem = torch.cuda.get_device_properties(0).total_memory
         logger.info(f"  VRAM: {total_mem / 1024**3:.1f} GB")
 
-    # Dependency installs
-    logger.info("Dependencies 설치 중...")
-    subprocess.run([sys.executable, '-m', 'pip', 'install', '-q',
-        'wget', 'text-unidecode', 'matplotlib>=3.3.2', 'Cython'], check=False)
-    subprocess.run([sys.executable, '-m', 'pip', 'install', '-q',
-        'huggingface-hub', 'librosa', 'datasets', 'soundfile', 'tqdm',
-        'jiwer', 'gTTS', 'runpod', 'sentencepiece', 'torchcodec'], check=False)
-    subprocess.run(['apt-get', 'install', '-y', '-qq',
-        'sox', 'libsndfile1', 'ffmpeg', 'libsox-fmt-mp3', 'jq'],
-        check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # Dependency installs — skip when SKIP_SETUP_INSTALL=1 (e.g. nemotron-asr-dgx image
+    # already has all deps pre-installed at correct versions).
+    if os.environ.get('SKIP_SETUP_INSTALL', '0') != '1':
+        logger.info("Dependencies 설치 중...")
+        subprocess.run([sys.executable, '-m', 'pip', 'install', '-q',
+            'wget', 'text-unidecode', 'matplotlib>=3.3.2', 'Cython'], check=False)
+        subprocess.run([sys.executable, '-m', 'pip', 'install', '-q',
+            'huggingface-hub', 'librosa', 'datasets', 'soundfile', 'tqdm',
+            'jiwer', 'gTTS', 'runpod', 'sentencepiece', 'torchcodec'], check=False)
+        subprocess.run(['apt-get', 'install', '-y', '-qq',
+            'sox', 'libsndfile1', 'ffmpeg', 'libsox-fmt-mp3', 'jq'],
+            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    # cuDNN 9 (required by NeMo, installed via pip into Python package dir)
-    subprocess.run([sys.executable, '-m', 'pip', 'install', '-q',
-        'nvidia-cudnn-cu12>=9', 'nvidia-nvjitlink-cu12'], check=False)
-    py_ver = f'python{sys.version_info.major}.{sys.version_info.minor}'
-    cudnn_lib = f'/usr/local/lib/{py_ver}/dist-packages/nvidia/cudnn/lib'
-    if os.path.isdir(cudnn_lib):
-        os.environ['LD_LIBRARY_PATH'] = cudnn_lib + ':' + os.environ.get('LD_LIBRARY_PATH', '')
+        # cuDNN 9 (required by NeMo, installed via pip into Python package dir)
+        subprocess.run([sys.executable, '-m', 'pip', 'install', '-q',
+            'nvidia-cudnn-cu12>=9', 'nvidia-nvjitlink-cu12'], check=False)
+        py_ver = f'python{sys.version_info.major}.{sys.version_info.minor}'
+        cudnn_lib = f'/usr/local/lib/{py_ver}/dist-packages/nvidia/cudnn/lib'
+        if os.path.isdir(cudnn_lib):
+            os.environ['LD_LIBRARY_PATH'] = cudnn_lib + ':' + os.environ.get('LD_LIBRARY_PATH', '')
 
-    # NeMo 2.7.3 pip + main branch source
-    # - pip 2.7.3: stable base with all dependencies
-    # - main branch: prompt model (EncDecRNNTBPEModelWithPrompt), streaming config
-    logger.info("NeMo 2.7.3 (pip) + main branch (source) 설치 중...")
-    subprocess.run(
-        [sys.executable, '-m', 'pip', 'install', '-q',
-         'nemo_toolkit[asr]==2.7.3'],
-        check=False
-    )
+        # NeMo 2.7.3 pip + main branch source
+        logger.info("NeMo 2.7.3 (pip) + main branch (source) 설치 중...")
+        subprocess.run(
+            [sys.executable, '-m', 'pip', 'install', '-q',
+             'nemo_toolkit[asr]==2.7.3'],
+            check=False
+        )
+    else:
+        logger.info("SKIP_SETUP_INSTALL=1 — pre-built image, skipping pip installs")
 
     if not NEMO_DIR.exists():
         logger.info(f"NeMo main 클론 중... {NEMO_DIR}")
