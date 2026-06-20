@@ -32,7 +32,8 @@ RUN pip install --no-cache-dir \
     # evaluation + data tools
     jiwer \
     gTTS \
-    torchcodec \
+    # torchcodec omitted: native lib fails on aarch64 (GB300 Grace CPU).
+    # datasets audio uses soundfile backend instead (DATASETS_AUDIO_BACKEND=soundfile).
     # NeMo core deps not in pytorch base
     "ruamel.yaml" \
     text-unidecode \
