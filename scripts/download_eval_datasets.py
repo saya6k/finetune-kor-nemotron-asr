@@ -49,6 +49,9 @@ FLEURS_LOCALES = {
     'fr': ('fr_fr', 'fr-FR', 'test_fleurs_fr'),
     'de': ('de_de', 'de-DE', 'test_fleurs_de'),
     'ru': ('ru_ru', 'ru-RU', 'test_fleurs_ru'),  # catastrophic-forgetting probe
+    'ja': ('ja_jp', 'ja-JP', 'test_fleurs_ja'),
+    'zh': ('cmn_hans_cn', 'zh-CN', 'test_fleurs_zh'),
+    'en': ('en_us', 'en-US', 'test_fleurs_en'),
 }
 
 
@@ -84,10 +87,14 @@ def download_fleurs(data_dir: Path, wav_cache: Path, langs=('ko', 'fr', 'de', 'r
             if not wav_path.exists():
                 resampled = librosa.resample(arr, orig_sr=sr, target_sr=16000) if sr != 16000 else arr
                 sf.write(str(wav_path), resampled, 16000)
+            text = sample['transcription'].strip()
+            if lang_tag == 'zh-CN':
+                # FLEURS zh stores space-separated characters; remove spaces for correct CER
+                text = text.replace(' ', '')
             entries.append({
                 'audio_filepath': str(wav_path),
                 'duration': round(len(arr) / sr, 3),
-                'text': sample['transcription'].strip(),
+                'text': text,
                 'lang': lang_tag,
                 'target_lang': lang_tag,
             })

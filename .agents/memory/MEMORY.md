@@ -1,3 +1,9 @@
 - [Dependency Compatibility Matrix](dependency-compatibility-matrix.md) — PyTorch, NeMo, CUDA version compatibility findings for RunPod ASR fine-tuning
 - [Source of Truth Setup](source-of-truth-setup.md) — Project memory and CLAUDE.md Source of Truth locations
 - [DGX Station Container Setup](dgx-station-container-setup.md) — docker run command, volume mounts (/raid/workspace, /raid/hf_cache), container path structure for GB300 DGX Station
+- [Table: Baseline First](feedback_table_baseline_first.md) — Always show baseline row first in training/eval tables so improvement is immediately visible
+- [Metric Display](feedback_metric_display.md) — CER for CJK (ko/zh/ja), WER for non-CJK (ru/fr/de/en) in eval tables
+- [Round 3 Plan](project_round3_plan.md) — ko 85% / en 8%(80K) / ja 6%(60K), zh 제거, patience=5
+- [Round 4 Resume](project_round4_resume.md) — Resume 시 전체 레이어 학습(동결 없음)으로 전환됨. patience=20, max_epochs=20, E1/0.4757부터 재개
+- [Round 5 Results](project_round5_results.md) — best val_wer=0.3590, fl_en 26→63% catastrophic forgetting (VoxPopuli replay 실패)
+- [Round 6 Plan](project_round6_plan.md) — ko 93.3% + FLEURS 39개국어 replay 6.7%, max_epochs=3, 원본 .nemo 재시작

@@ -4,7 +4,7 @@ Workaround for NeMo bug: transcribe() with raw audio paths on prompt-based model
 doesn't propagate language to Cut objects. We monkey-patch the prompt dataloader
 to use a fallback language when cut.supervisions[0].language is None/'None'.
 """
-import json, os, sys, csv, time
+import gc, json, os, sys, csv, time
 from pathlib import Path
 import torch
 import jiwer
@@ -48,17 +48,99 @@ def patch_prompt_dataloader(fallback_lang: str):
     return True
 
 
-def eval_checkpoint(ckpt_path: str, datasets: dict, device: str = "cuda:0") -> list:
-    """Load checkpoint once, evaluate all datasets, return list of result dicts."""
-    import torch
+def _patch_nemo_torch_load():
+    """Monkey-patch NeMo's save_restore_connector to use weights_only=False.
+
+    PyTorch 2.6+ defaults to weights_only=True, which breaks loading of .nemo
+    files whose weights include custom reduce functions (e.g. encoder bias).
+    """
+    from nemo.core.connectors.save_restore_connector import SaveRestoreConnector
+
+    original_fn = SaveRestoreConnector._load_state_dict_from_disk
+    _torch = torch  # capture module-level torch in closure (avoid import-in-func)
+
+    @staticmethod
+    def patched_load_state_dict(model_weights, map_location=None):
+        return _torch.load(model_weights, map_location=map_location, weights_only=False)
+
+    SaveRestoreConnector._load_state_dict_from_disk = patched_load_state_dict
+    return True
+
+
+def _load_model_from_ckpt(ckpt_path: str, base_nemo_dir: str, device: str = "cuda:0"):
+    """Load a .ckpt (PyTorch Lightning) checkpoint by restoring the original
+    pretrained .nemo architecture and then loading the fine-tuned state_dict."""
+    gc.collect()
+    torch.cuda.empty_cache()
+    _patch_nemo_torch_load()
     from nemo.collections.asr.models import EncDecRNNTBPEModelWithPrompt
 
-    print(f"\n{'='*60}")
-    print(f"Loading {Path(ckpt_path).name} ...")
+    # Find the ORIGINAL pretrained base model (not the training-updated one).
+    # Priority: 1) /workspace/data/base_model/  2) checkpoint parent dir
+    original_candidates = [
+        "/workspace/data/base_model/nemotron-3.5-asr-streaming-0.6b.nemo",
+        "/workspace/data/base_model/nemotron-3.5-asr-streaming-0.6b-v1.nemo",
+    ]
+    base_nemo = None
+    for cand in original_candidates:
+        if os.path.exists(cand):
+            base_nemo = cand
+            break
+    if not base_nemo:
+        # Fallback: search near the checkpoint or in base_nemo_dir
+        base_dir = Path(ckpt_path).parent
+        nemo_files = sorted(base_dir.rglob("*.nemo"))
+        if not nemo_files:
+            nemo_files = sorted(Path(base_nemo_dir).rglob("*.nemo"))
+        if nemo_files:
+            base_nemo = str(nemo_files[0])
+    if not base_nemo:
+        raise FileNotFoundError(f"No base .nemo found near {ckpt_path}")
+
+    print(f"  Loading base model from {Path(base_nemo).name} ...", flush=True)
     t0 = time.time()
-    model = EncDecRNNTBPEModelWithPrompt.restore_from(ckpt_path, map_location=device)
+    model = EncDecRNNTBPEModelWithPrompt.restore_from(base_nemo, map_location=device)
     model = model.to(device)
+    print(f"    Base loaded in {time.time()-t0:.1f}s", flush=True)
+
+    print(f"  Loading state_dict from {Path(ckpt_path).name} ...", flush=True)
+    t1 = time.time()
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    model.load_state_dict(ckpt["state_dict"], strict=True)
     model.eval()
+    print(f"    State dict loaded in {time.time()-t1:.1f}s", flush=True)
+    return model
+
+
+def eval_checkpoint(ckpt_path: str, datasets: dict, device: str = "cuda:0",
+                    base_nemo_dir: str = None) -> list:
+    """Load checkpoint once, evaluate all datasets, return list of result dicts.
+
+    Handles both .nemo (NeMo archive) and .ckpt (PyTorch Lightning) checkpoints.
+    """
+    from nemo.collections.asr.models import EncDecRNNTBPEModelWithPrompt
+
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    ckpt_path = Path(ckpt_path)
+    is_ckpt = ckpt_path.suffix == ".ckpt"
+
+    print(f"\n{'='*60}")
+    print(f"Loading {ckpt_path.name} ...")
+    t0 = time.time()
+
+    if is_ckpt:
+        model = _load_model_from_ckpt(str(ckpt_path),
+                                      base_nemo_dir or str(ckpt_path.parent),
+                                      device)
+    else:
+        _patch_nemo_torch_load()
+        gc.collect()
+        torch.cuda.empty_cache()
+        model = EncDecRNNTBPEModelWithPrompt.restore_from(str(ckpt_path), map_location=device)
+        model = model.to(device)
+        model.eval()
     print(f"  Loaded in {time.time()-t0:.1f}s")
 
     results = []
@@ -78,6 +160,7 @@ def eval_checkpoint(ckpt_path: str, datasets: dict, device: str = "cuda:0") -> l
             traceback.print_exc()
 
     del model
+    gc.collect()
     torch.cuda.empty_cache()
     return results
 
@@ -118,13 +201,25 @@ def _eval_with_model(model, checkpoint_path, manifest_path, ds_name, device="cud
             print(f"    [{progress}/{len(audio_paths)}] CER={partial_cer:.2f}%", flush=True)
 
     elapsed = time.time() - t1
-    cer = jiwer.cer(refs, hyps) * 100
-    wer = jiwer.wer(refs, hyps) * 100
-    ser = sum(1 for r, h in zip(refs, hyps) if r != h) / len(refs) * 100
-    print(f"  [{ds_name}] CER={cer:.2f}% WER={wer:.2f}% ({elapsed:.0f}s)", flush=True)
+    refs_n = [r.lower() for r in refs]
+    hyps_n = [h.lower() for h in hyps]
+
+    # Filter empty hypothesis pairs (empty output = model silence, handled separately)
+    pairs = [(r, h) for r, h in zip(refs_n, hyps_n) if h.strip()]
+    empty_count = len(refs_n) - len(pairs)
+    empty_rate = empty_count / len(refs_n) * 100 if refs_n else 0
+    if empty_count:
+        print(f"    Empty outputs: {empty_count}/{len(refs_n)} ({empty_rate:.1f}%)", flush=True)
+    refs_f = [r for r, _ in pairs]
+    hyps_f = [h for _, h in pairs]
+
+    cer = jiwer.cer(refs_f, hyps_f) * 100 if refs_f else 0.0
+    wer = jiwer.wer(refs_f, hyps_f) * 100 if refs_f else 0.0
+    ser = sum(1 for r, h in zip(refs_n, hyps_n) if r != h) / len(refs) * 100
+    print(f"  [{ds_name}] CER={cer:.2f}% WER={wer:.2f}% empty={empty_rate:.1f}% ({elapsed:.0f}s)", flush=True)
 
     return {"checkpoint": ckpt_name, "dataset": ds_name, "cer": cer, "wer": wer,
-            "ser": ser, "num_samples": len(data)}
+            "ser": ser, "num_samples": len(data), "empty_rate": empty_rate}
 
 
 def _extract_text(item):
@@ -195,11 +290,22 @@ def run_eval(checkpoint_path, manifest_path, ds_name, device="cuda:0"):
     elapsed = time.time() - t1
     print(f"  Done in {elapsed:.1f}s ({len(audio_paths)/elapsed:.1f} samples/s)")
 
-    cer = jiwer.cer(refs, hyps) * 100
-    wer = jiwer.wer(refs, hyps) * 100
-    ser = sum(1 for r, h in zip(refs, hyps) if r != h) / len(refs) * 100
+    refs_n = [r.lower() for r in refs]
+    hyps_n = [h.lower() for h in hyps]
 
-    print(f"  CER={cer:.2f}% WER={wer:.2f}% SER={ser:.2f}%")
+    pairs = [(r, h) for r, h in zip(refs_n, hyps_n) if h.strip()]
+    empty_count = len(refs_n) - len(pairs)
+    empty_rate = empty_count / len(refs_n) * 100 if refs_n else 0
+    if empty_count:
+        print(f"  Empty outputs: {empty_count}/{len(refs_n)} ({empty_rate:.1f}%)")
+    refs_f = [r for r, _ in pairs]
+    hyps_f = [h for _, h in pairs]
+
+    cer = jiwer.cer(refs_f, hyps_f) * 100 if refs_f else 0.0
+    wer = jiwer.wer(refs_f, hyps_f) * 100 if refs_f else 0.0
+    ser = sum(1 for r, h in zip(refs_n, hyps_n) if r != h) / len(refs) * 100
+
+    print(f"  CER={cer:.2f}% WER={wer:.2f}% empty={empty_rate:.1f}% SER={ser:.2f}%")
     del model
     torch.cuda.empty_cache()
     return {"checkpoint": ckpt_name, "dataset": ds_name, "cer": cer, "wer": wer, "ser": ser, "num_samples": len(data)}

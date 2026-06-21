@@ -36,6 +36,7 @@ def _process_tar(args):
     lang_prefix = lang_tag.split('-')[0].lower()
     entries = []
     skipped = 0
+    success = False
 
     try:
         with tarfile.open(tar_path, 'r:*') as tar:
@@ -105,15 +106,16 @@ def _process_tar(args):
                     "lang": lang_tag,
                     "target_lang": lang_tag,
                 })
+        success = True
     except Exception as e:
         print(f"  ERROR {tar_path}: {e}", flush=True)
-        return 0
+        return tar_path, 0, False
 
     with open(partial_out, 'w', encoding='utf-8') as f:
         for e in entries:
             f.write(json.dumps(e, ensure_ascii=False) + '\n')
 
-    return len(entries)
+    return tar_path, len(entries), success
 
 
 def main():
@@ -132,6 +134,8 @@ def main():
                         help='Max TARs to process (0 = all)')
     parser.add_argument('--max-entries', type=int, default=0,
                         help='Stop after collecting this many entries (0 = unlimited)')
+    parser.add_argument('--delete-after', action='store_true',
+                        help='Delete TAR files after successful processing')
     args = parser.parse_args()
 
     emilia_dir = Path(args.emilia_dir)
@@ -173,10 +177,8 @@ def main():
 
     if tasks:
         with Pool(processes=args.workers) as pool:
-            for i, n in enumerate(pool.imap_unordered(_process_tar, tasks), 1):
-                if args.max_entries > 0 and total >= args.max_entries:
-                    pool.terminate()
-                    break
+            for i, result in enumerate(pool.imap_unordered(_process_tar, tasks), 1):
+                tar_path, n, success = result
                 total += n
                 elapsed = time.time() - t0
                 rate = total / elapsed if elapsed > 0 else 0
@@ -184,6 +186,16 @@ def main():
                 print(f"  [{i}/{len(tasks)}] +{n} entries | "
                       f"total={total} | {rate:.0f}/s | ETA {eta/60:.1f}min",
                       flush=True)
+                if args.delete_after and success:
+                    try:
+                        sz = os.path.getsize(tar_path)
+                        os.remove(tar_path)
+                        print(f"    🗑 Deleted TAR ({sz/1024**2:.0f} MB freed)", flush=True)
+                    except Exception as e:
+                        print(f"    Failed to delete TAR: {e}", flush=True)
+                if args.max_entries > 0 and total >= args.max_entries:
+                    pool.terminate()
+                    break
 
     # Merge all partials into final output
     print(f"\nMerging {len(list(partials_dir.glob('*.jsonl')))} partial files...", flush=True)

@@ -366,3 +366,320 @@ scripts/
 - [Blackwell Architecture (sm_100) — CUDA Compute Capability](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#compute-capabilities)
 - [NeMo GitHub — main branch](https://github.com/NVIDIA/NeMo)
 - [RunPod 검증 파이프라인 — CLAUDE.md](./CLAUDE.md) (2026-06-17 검증됨)
+
+---
+
+# Round 2: AIHub 데이터셋 확장 및 DGX 전층 동결 학습
+
+> 작성일: 2026-06-21  
+> 이전 라운드 대비 변경: 데이터셋 4종 추가, 텍스트 정규화 수정, 오디오 세그멘테이션, DGX 학습 설정 변경
+
+---
+
+## R2-1. 데이터셋 확장
+
+### 배경
+
+Round 1은 Emilia-YODAS 한국어 스트리밍 + LibriSpeech(EN) + AISHELL(ZH) 구성이었음. Round 2는 AIHub 한국어 데이터셋 4종을 추가해 총 877,704발화 / 1,396h로 확장.
+
+JA/DE/FR Emilia 데이터는 확보 실패 (TAR 삭제 후 WAV 경로 소실) — Round 3에서 재다운로드 예정.
+
+### 학습 데이터 구성 (Round 2 최종)
+
+| 데이터셋 | 언어 | 소스 | 발화 수 | 시간 | 평균 길이 |
+|---------|------|------|--------|------|---------|
+| KsponSpeech | ko-KR | AIHub | 618,720 | 957.7h | 5.6s |
+| 회의음성 (Meeting) | ko-KR | AIHub | 81,413 | 150.0h | 6.6s |
+| FreeTalk Studio | ko-KR | AIHub | 58,210 | 93.9h | 5.8s |
+| FreeTalk Field | ko-KR | AIHub | 47,936 | 74.7h | 5.6s |
+| 극한소음 (Extreme Noise) | ko-KR | AIHub | 6,546 | 19.8h | 10.9s |
+| LibriSpeech (clean-100) | en-US | OpenSLR | 24,879 | 50.0h | 7.2s |
+| AISHELL-1 | zh-CN | AISHELL | 40,000 | 50.3h | 4.5s |
+| **합계** | | | **877,704** | **1,396.4h** | **5.7s** |
+
+언어 비율: ko-KR 92.6% (812,825), zh-CN 4.6% (40,000), en-US 2.8% (24,879)
+
+manifest 파일: `/workspace/data/processed/train_manifest_round2.jsonl`
+
+---
+
+## R2-2. 텍스트 정규화
+
+### AIHub 한국어 주석 형식
+
+AIHub 데이터셋은 `(표기형)/(발음형)` 이중 표기 형식을 사용함. 학습에는 **발음형(spoken form)** 을 사용해야 함.
+
+**주의**: 데이터셋마다 순서가 반대임.
+
+| 데이터셋 | 형식 | 발음형 위치 | 예시 |
+|---------|------|-----------|------|
+| KsponSpeech | `(표기)/(발음)` | 오른쪽 | `(이십 대)/(20대)` → `20대` |
+| Extreme Noise | `(표기)/(발음)` | 오른쪽 | KsponSpeech와 동일 |
+| 회의음성 (Meeting) | `(발음)/(표기)` | **왼쪽** | `(이십 대)/(20대)` → `이십 대` |
+
+### KsponSpeech / Extreme Noise 정규화 (`convert_ksponspeech.py`, `_normalize()`)
+
+```python
+text = re.sub(r"\([^)]+\)/\(([^)]+)\)", r"\1", text)  # (표기)/(발음) → 발음
+text = re.sub(r"\s?[bnluo]/\s?", " ", text)            # b/ n/ l/ u/ o/ 비언어 마커
+text = re.sub(r"\s?\+/\s?", " ", text)                 # +/ 연장 마커
+text = re.sub(r"\S+\+", "", text)                       # word+ 잘린 발화
+text = re.sub(r"\S*\*\S*", "", text)                   # word*, *word, * 독립 마커
+text = re.sub(r"(\S)/", r"\1", text)                   # 그/ → 그 (발화 겹침)
+```
+
+**핵심 버그 이력**: `\S+\*` → `\S*\*\S*` 수정 (2026-06-21)
+- `\S+\*`는 `word*` 형태만 처리, `*아니야`(접두) / ` * `(독립) 누락
+- 수정 후 KsponSpeech 618,720발화 중 추가 333건 변경됨
+
+### 회의음성 정규화 (`convert_meeting.py`, `_normalize()`)
+
+```python
+text = re.sub(r"\(([^)]+)\)/\([^)]+\)", r"\1", text)  # (발음)/(표기) → 발음 (순서 주의!)
+text = re.sub(r"/\s*\([^)]+\)", "", text)              # /(bgm), /(noise) 배경음 태그
+text = re.sub(r"@\S+", "", text)                       # @이름N 화자 태그
+```
+
+**순서 중요**: `(A)/(B)→A` 추출 먼저, `/(bgm)` 제거 나중. 반대로 하면 `(이십 대)/(20대)`에서 `/(20대)`가 먼저 제거되어 `(이십 대)` 잔존.
+
+### 정규화 후처리 도구
+
+기존 manifest 재정규화가 필요한 경우:
+```bash
+python3 scripts/normalize_manifests.py --type ksponspeech data/processed/ksponspeech_train.jsonl
+python3 scripts/normalize_manifests.py --type meeting data/processed/meeting_train.jsonl
+```
+
+---
+
+## R2-3. 오디오 세그멘테이션
+
+### 문제: max_duration=20으로 전체 녹음 파일 필터링
+
+NeMo 학습 설정 `max_duration=20`은 20초 초과 발화를 드롭함. AIHub 원본 파일은 녹음 단위가 매우 길어 직접 사용 불가:
+
+| 데이터셋 | 원본 평균 길이 | 문제 |
+|---------|-------------|------|
+| 극한소음 | ~830s | 전량 필터링 |
+| 회의음성 | ~2,372s | 전량 필터링 |
+
+세그멘테이션으로 해결: 타임스탬프 기반으로 개별 발화를 분리해 1-20s 클립으로 저장.
+
+### 회의음성 세그멘테이션 (`convert_meeting.py`)
+
+- 레이블: JSON utterance 배열, 각 utterance에 `start`/`end` float 필드
+- 처리: soundfile로 전체 WAV 로드 → 타임스탬프 슬라이싱 → 개별 WAV 저장
+- 결과: 673 녹음 파일 → **81,413 발화** (1-20s)
+- 출력: `/workspace/data/wav_cache/meeting/segments/*.wav`
+
+```python
+# MIN_DUR=1.0, MAX_DUR=20.0
+for utt_id, start, end, text in segments:
+    clip = audio[int(start*sr):int(end*sr)]
+    sf.write(clip_path, clip, sr)
+```
+
+**실행 환경**: 호스트에 soundfile 없음 → Docker 컨테이너 내에서 실행해야 함
+```bash
+docker run --rm -v /root/nemotron-asr-finetune:/workspace nemotron-asr-dgx:latest \
+  python3 /workspace/finetune-kor-nemotron-asr/scripts/convert_meeting.py \
+  --label-zip /workspace/data/raw/meeting/TL5.zip \
+  --source-zip /workspace/data/raw/meeting/TS5.zip \
+  --wav-cache /workspace/data/wav_cache/meeting \
+  --output /workspace/data/processed/meeting_train.jsonl \
+  --max-hours 150
+```
+
+### 극한소음 세그멘테이션 (`convert_extreme_noise.py`)
+
+- 레이블: 중첩 ZIP 구조 (`labeling.zip` → 24개 서브 ZIP → SRT + JSON 쌍)
+- SRT 타임스탬프 파싱: `HH:MM:SS,mmm --> HH:MM:SS,mmm`
+- 처리: SRT segments 파싱 → JSON `mediaUrl`로 WAV 매칭 → 슬라이싱
+- 결과: 440 녹음 파일 → **6,546 발화** (0.5-20s)
+- 출력: `/workspace/data/wav_cache/extreme_noise/segments/*.wav`
+
+```python
+# labeling.zip → sub_zip → (srt_map, json_map) 매칭
+with zipfile.ZipFile(label_zip_path) as outer:
+    for sub_name in sub_zips:  # 24개 서브 ZIP
+        with zipfile.ZipFile(io.BytesIO(outer.read(sub_name))) as inner:
+            # SRT 파싱 후 JSON mediaUrl로 WAV basename 매핑
+```
+
+---
+
+## R2-4. 평가 데이터셋 (Round 2)
+
+| # | 이름 | 용도 | 소스 |
+|---|------|------|------|
+| 1 | `val_emilia_holdout_ko` | **Validation / Early Stopping** | Emilia-YODAS KO holdout |
+| 2 | `test_fleurs_ko` | Test — 주요 KO 벤치마크 | FLEURS ko_kr |
+| 3 | `test_emilia_holdout_ko` | Test — val과 분리된 holdout | Emilia-YODAS KO holdout B |
+| 4 | `test_zeroth_ko` | Test | Zeroth Korean |
+| 5 | `test_mixed_en` | Test | Emilia-YODAS EN |
+| 6 | `test_mixed_ja` | Test | Emilia-YODAS JA |
+| 7 | `test_mixed_zh` | Test | Emilia-YODAS ZH |
+| 8 | `test_fleurs_fr` | Test — 학습 언어 WER | FLEURS fr_fr |
+| 9 | `test_fleurs_de` | Test — 학습 언어 WER | FLEURS de_de |
+| 10 | `test_fleurs_ru` | **Catastrophic forgetting 프로브** (비학습) | FLEURS ru_ru |
+
+val set: `val_ksponspeech_500.jsonl` (KsponSpeech 에서 무작위 500발화 — 학습 외 보유)  
+eval config: `/workspace/data/processed/eval_datasets_round2.json`
+
+---
+
+## R2-5. DGX 학습 설정 (finetune_with_freeze.py)
+
+### 레이어 동결 전략
+
+Round 2는 `finetune_with_freeze.py` 사용. FastConformer 인코더 하위 8 레이어를 동결해 pretrained 표현 보존.
+
+```
+encoder.layers[0:8] frozen (208 tensors) | trainable: 447/655
+```
+
+- 동결: 인코더 하위 8층 (conv subsampling + 초기 conformer blocks)
+- 학습 가능: 상위 16층 + 디코더(RNNT) + joint network
+
+### 학습 명령 (Round 2 확정)
+
+```bash
+python3 /workspace/finetune-kor-nemotron-asr/scripts/finetune_with_freeze.py \
+  --config-path=../asr/conf/fastconformer/cache_aware_streaming \
+  --config-name=fastconformer_transducer_bpe_streaming_prompt.yaml \
+  +init_from_nemo_model=/workspace/data/checkpoints/FastConformer-Transducer-BPE-Prompt-Streaming/checkpoints/FastConformer-Transducer-BPE-Prompt-Streaming.nemo \
+  ++model.train_ds.manifest_filepath=/workspace/data/processed/train_manifest_round2.jsonl \
+  ++model.validation_ds.manifest_filepath=/workspace/data/processed/val_ksponspeech_500.jsonl \
+  ++model.tokenizer.dir=/workspace/data/checkpoints \
+  ++trainer.devices=1 \
+  ++trainer.max_epochs=10 \
+  ++trainer.precision=bf16 \
+  ++trainer.gradient_clip_val=1.0 \
+  ++seed_everything=42 \
+  ++model.train_ds.batch_duration=5000 \
+  ++model.validation_ds.batch_size=1 \
+  ++model.train_ds.max_duration=20 \
+  ++model.optim.name=adamw \
+  ++model.optim.lr=0.00005 \
+  ++model.optim.weight_decay=0.001 \
+  ++model.optim.sched.name=CosineAnnealing \
+  ++model.optim.sched.warmup_ratio=0.05 \
+  ++model.optim.sched.warmup_steps=null \
+  ++model.optim.sched.min_lr=1e-6 \
+  ~model.optim.sched.d_model \
+  ++exp_manager.exp_dir=/workspace/data/checkpoints_round2 \
+  ++exp_manager.resume_if_exists=true \
+  ++exp_manager.resume_ignore_no_checkpoint=true \
+  ++exp_manager.create_early_stopping_callback=true \
+  ++exp_manager.early_stopping_callback_params.monitor=val_wer \
+  ++exp_manager.early_stopping_callback_params.patience=10 \
+  ++exp_manager.checkpoint_callback_params.save_top_k=-1 \
+  ++exp_manager.checkpoint_callback_params.monitor=val_wer \
+  ++exp_manager.checkpoint_callback_params.save_last=true \
+  ++exp_manager.checkpoint_callback_params.every_n_train_steps=250 \
+  ++exp_manager.checkpoint_callback_params.every_n_epochs=null \
+  ++trainer.val_check_interval=250
+```
+
+### Round 1 → Round 2 파라미터 변경
+
+| 파라미터 | Round 1 | Round 2 | 이유 |
+|---------|---------|---------|------|
+| 스크립트 | `speech_to_text_finetune.py` | `finetune_with_freeze.py` | 레이어 동결 |
+| `lr` | 1e-4 | **5e-5** | 더 많은 데이터로 보수적 학습률 |
+| `batch_duration` | 100s | **5000s** | GB300 VRAM 284GB 활용 |
+| `max_epochs` | 20 | **10** | 조기 수렴 예상 |
+| `val_check_interval` | 500 | **250** | 더 촘촘한 체크포인트 |
+| `every_n_train_steps` | 500 | **250** | 동일 |
+| `d_model` 처리 | `++...d_model=1024` | `~model.optim.sched.d_model` | NeMo 3.x Hydra delete |
+| validation set | `val_emilia_holdout_ko` | **`val_ksponspeech_500`** | 학습 외 보유 세트 |
+
+### 예상 step 수
+
+총 학습 데이터: 877,704발화 × 5.7s평균 ≈ 5,003,000s  
+Steps/epoch (batch_duration=5000): 5,003,000 / 5000 ≈ **1,001 steps**  
+체크포인트 간격: 250 steps (≈ 에폭의 25%)
+
+---
+
+## R2-6. 평가 파이프라인 (eval_watcher.py + eval_one.py)
+
+### eval_watcher.py
+
+체크포인트 디렉토리를 감시하다가 새 `.ckpt`/`.nemo` 파일이 생기면 자동으로 eval_one.py를 실행.
+
+```bash
+python3 /workspace/finetune-kor-nemotron-asr/scripts/eval_watcher.py \
+  --checkpoint-dir /workspace/data/checkpoints_round2 \
+  --datasets-json /workspace/data/processed/eval_datasets_round2.json \
+  --output-csv /workspace/results/eval_rolling_round2.csv
+```
+
+### eval_one.py
+
+단일 체크포인트 × 복수 데이터셋 평가. CER/WER/SER 산출 후 CSV append.
+
+```bash
+python3 /workspace/finetune-kor-nemotron-asr/scripts/eval_one.py \
+  --ckpt <path>.nemo \
+  --datasets-json /workspace/data/processed/eval_datasets_round2.json \
+  --output-csv /workspace/results/eval_rolling_round2.csv \
+  --device cuda:0
+```
+
+결과 파일: `/workspace/results/eval_rolling_round2.csv`
+
+---
+
+## R2-7. 초기 실험 결과 (참고용)
+
+> 아래는 Round 2 이전 별도 실험 (작은 데이터셋, batch_duration=100)에서 epoch 0-12 학습 결과.  
+> Round 2 공식 결과는 `eval_rolling_round2.csv` 에 누적 중.
+
+### Baseline (pretrained, fine-tune 없음)
+
+| 데이터셋 | CER | WER | SER |
+|---------|-----|-----|-----|
+| val_emilia_holdout_ko | 15.6% | 34.9% | 96.9% |
+| test_fleurs_ko | 10.3% | 29.2% | 100.0% |
+| test_zeroth_ko | 11.3% | 36.4% | 100.0% |
+| test_mixed_en | 7.4% | 17.2% | 90.8% |
+| test_mixed_ja | 23.9% | 96.6% | 92.6% |
+| test_mixed_zh | 36.6% | 140.0% | 97.6% |
+| test_fleurs_fr | 8.6% | 26.0% | 100.0% |
+| test_fleurs_de | 10.8% | 46.0% | 100.0% |
+| test_fleurs_ru | 7.3% | 31.9% | 100.0% |
+
+모델카드 기준: CER 7.12 on FLEURS KO (1.12s chunk, LangID mode)
+
+### Best checkpoint 결과 (val_wer=0.3182, epoch=12)
+
+| 데이터셋 | CER | WER | Δ WER |
+|---------|-----|-----|-------|
+| val_emilia_holdout_ko | 14.4% | 32.0% | −2.9% |
+| test_fleurs_ko | 10.0% | 28.2% | −1.0% |
+| test_zeroth_ko | 12.0% | 36.5% | ~0% |
+| test_mixed_en | 5.1% | 12.8% | **−4.4%** |
+| test_mixed_ja | 19.8% | 87.8% | −8.8% |
+| test_mixed_zh | 36.5% | 102.6% | −37.4% |
+| test_fleurs_fr | 7.5% | 26.5% | +0.5% |
+| test_fleurs_de | 9.5% | 46.0% | ~0% |
+| test_fleurs_ru | 9.1% | 35.0% | **+3.1% (forgetting!)** |
+
+**관찰**:
+- 한국어 개선 미미 (FLEURS KO WER: 29.2% → 28.2%)
+- 러시아어 forgetting 발생 (+3.1 WER) — JA/DE/FR 학습 데이터 미포함이 원인
+- JA/ZH는 학습 데이터 없어도 WER 하락 (모델 내 잠재 능력 회복으로 추정)
+- Epoch 12 마지막 체크포인트(`val_wer=0.3163`)는 CER/WER=98% 붕괴(collapse) — patience=10 조기 중단 필요성 확인
+
+---
+
+## R2-8. 미해결 과제
+
+| 항목 | 상태 | 비고 |
+|------|------|------|
+| JA/DE/FR Emilia 데이터 재다운로드 | 미완료 | TAR 삭제로 WAV 소실, Round 3 재수집 필요 |
+| Forgetting 완화 (RU) | 미완료 | RU 데이터 추가 또는 regularization 필요 |
+| 회의음성 정규화 오염 (1차 pass) | 저우선순위 | 원본 녹음 파일은 max_duration=20 초과로 학습에 미사용 |
+| 극한소음 추가 확보 | 고려 | 현재 19.8h — 더 많은 zip 파일 처리 가능 |
+| val set 대표성 | 검토 필요 | val_ksponspeech_500은 read-speech; 회의/노이즈 환경 반영 안됨 |

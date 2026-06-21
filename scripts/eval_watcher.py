@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Checkpoint watcher: evaluates new .nemo checkpoints as they appear during training.
+"""Checkpoint watcher: evaluates new .nemo and .ckpt checkpoints as they appear.
 
-Polls checkpoint_dir every POLL_INTERVAL seconds. When a new .nemo file is found,
-loads it once and evaluates all configured datasets, then appends results to CSV.
+Polls checkpoint_dir every POLL_INTERVAL seconds. When a new .nemo or .ckpt file is
+found, loads it once and evaluates all configured datasets, then appends results to CSV.
+-last.ckpt files are skipped (duplicate of the epoch's primary .ckpt).
 
 Usage:
     python3 scripts/eval_watcher.py \
@@ -59,14 +60,21 @@ def load_evaluated(output_csv: str) -> set:
 
 
 def find_checkpoints(checkpoint_dir: str) -> list:
-    return sorted(Path(checkpoint_dir).rglob("*.nemo"), key=lambda p: p.stat().st_mtime)
+    """Find all evaluatable checkpoints (.nemo + .ckpt), excluding -last.ckpt duplicates."""
+    nemo = Path(checkpoint_dir).rglob("*.nemo")
+    ckpt = [p for p in Path(checkpoint_dir).rglob("*.ckpt")
+            if "-last.ckpt" not in p.name]
+    return sorted(list(nemo) + list(ckpt), key=lambda p: p.stat().st_mtime)
 
 
-def run_watcher(checkpoint_dir: str, datasets: dict, output_csv: str, device: str):
-    sys.path.insert(0, str(Path(__file__).parent))
-    from eval_direct import eval_checkpoint
+def run_watcher(checkpoint_dir: str, datasets: dict, output_csv: str, device: str,
+                datasets_json_path: str = ""):
+    import subprocess
+    import tempfile
 
     evaluated = load_evaluated(output_csv)
+    eval_one_script = str(Path(__file__).parent / "eval_one.py")
+
     print(f"Watcher started. Polling {checkpoint_dir} every {POLL_INTERVAL}s", flush=True)
     print(f"Output: {output_csv}", flush=True)
     print(f"Datasets: {list(datasets.keys())}", flush=True)
@@ -89,19 +97,48 @@ def run_watcher(checkpoint_dir: str, datasets: dict, output_csv: str, device: st
                 print(f"  {ckpt_name} still being written, skipping for now.", flush=True)
                 continue
 
-            print(f"  Evaluating {len(pending_datasets)} datasets...", flush=True)
+            print(f"  Evaluating {len(pending_datasets)} datasets via subprocess...", flush=True)
             t0 = time.time()
+            tmp_json = tempfile.NamedTemporaryFile(
+                mode='w', suffix='.json', delete=False, dir='/tmp'
+            )
+            json.dump(pending_datasets, tmp_json)
+            tmp_json.close()
             try:
-                results = eval_checkpoint(str(ckpt), pending_datasets, device=device)
-                for r in results:
-                    r["eval_time"] = round(time.time() - t0, 1)
-                    evaluated.add((ckpt_name, r["dataset"]))
-                append_results(output_csv, results)
-                print(f"  Done: {len(results)} results appended to {output_csv}", flush=True)
+                result = subprocess.run(
+                    [sys.executable, eval_one_script,
+                     "--ckpt", str(ckpt),
+                     "--datasets-json", tmp_json.name,
+                     "--output-csv", output_csv,
+                     "--base-nemo-dir", checkpoint_dir,
+                     "--device", device],
+                    capture_output=True, text=True, timeout=3600,
+                )
+                # Print subprocess stdout for visibility
+                if result.stdout:
+                    for line in result.stdout.strip().splitlines():
+                        print(f"  {line}", flush=True)
+                if result.stderr:
+                    # stderr may contain NeMo warnings — print selectively
+                    for line in result.stderr.strip().splitlines():
+                        if "ERROR" in line or "Traceback" in line or "Error" in line:
+                            print(f"  [stderr] {line}", flush=True)
+
+                if result.returncode == 0:
+                    for ds_name in pending_datasets:
+                        evaluated.add((ckpt_name, ds_name))
+                    elapsed = time.time() - t0
+                    print(f"  Done in {elapsed:.0f}s: {len(pending_datasets)} results → {output_csv}", flush=True)
+                else:
+                    print(f"  Subprocess exited with code {result.returncode}", flush=True)
+            except subprocess.TimeoutExpired:
+                print(f"  TIMEOUT evaluating {ckpt_name} (1h limit)", flush=True)
             except Exception as e:
                 import traceback
                 print(f"  ERROR evaluating {ckpt_name}: {e}", flush=True)
                 traceback.print_exc()
+            finally:
+                Path(tmp_json.name).unlink(missing_ok=True)
 
         print(f"[{time.strftime('%H:%M:%S')}] Checked {len(checkpoints)} checkpoints, "
               f"sleeping {POLL_INTERVAL}s ...", flush=True)
@@ -120,7 +157,8 @@ def main():
     with open(args.datasets_json) as f:
         datasets = json.load(f)
 
-    run_watcher(args.checkpoint_dir, datasets, args.output_csv, args.device)
+    run_watcher(args.checkpoint_dir, datasets, args.output_csv, args.device,
+                datasets_json_path=args.datasets_json)
 
 
 if __name__ == "__main__":

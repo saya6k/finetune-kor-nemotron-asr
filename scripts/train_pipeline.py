@@ -296,7 +296,7 @@ FAST_INGEST_WORKERS = int(os.environ.get('FAST_INGEST_WORKERS', '32'))
 
 def _run_fast_ingest(emilia_lang_dir: str, wav_cache: str, output: str,
                      lang_tag: str, max_shards: int = 0,
-                     max_entries: int = 0) -> int:
+                     max_entries: int = 0, delete_after: bool = False) -> int:
     """Run fast_ingest.py as a subprocess. Returns number of entries written."""
     script = str(Path(__file__).resolve().parent / 'fast_ingest.py')
     cmd = [
@@ -311,6 +311,8 @@ def _run_fast_ingest(emilia_lang_dir: str, wav_cache: str, output: str,
         cmd += ['--max-shards', str(max_shards)]
     if max_entries > 0:
         cmd += ['--max-entries', str(max_entries)]
+    if delete_after:
+        cmd += ['--delete-after']
     logger.info(f"fast_ingest: {emilia_lang_dir} → {output}  (workers={FAST_INGEST_WORKERS})")
     result = subprocess.run(cmd, check=True)
     n = sum(1 for line in open(output) if line.strip()) if os.path.exists(output) else 0
@@ -345,7 +347,7 @@ def data_ingest() -> Tuple[str, int]:
             # Rough estimate: ~16k entries per TAR → 1 TAR per SMOKE_N/16000 shards
             max_shards = max(1, SMOKE_N // 16000 + 1)
         n = _run_fast_ingest(ko_dir, str(WAV_CACHE_DIR), str(temp_path),
-                             'ko-KR', max_shards=max_shards)
+                             'ko-KR', max_shards=max_shards, delete_after=True)
         if SMOKE_N > 0 and n > SMOKE_N:
             # Trim to SMOKE_N
             with open(temp_path) as f:
@@ -613,7 +615,7 @@ def language_mix(manifests: Dict[str, str]) -> str:
                     # Estimate shards needed: ~16k entries/TAR
                     needed_shards = max(1, (target_n + 500) // 16000 + 2)
                     _run_fast_ingest(lang_dir, str(WAV_CACHE_DIR), lang_temp,
-                                     lang_tag, max_shards=needed_shards)
+                                     lang_tag, max_shards=needed_shards, delete_after=True)
                 with open(lang_temp) as f:
                     lang_entries = [json.loads(l) for l in f if l.strip()]
             else:
@@ -817,6 +819,7 @@ def train(hf_ckpt: str, mixed_manifest: str, val_manifest: str) -> int:
         '++exp_manager.checkpoint_callback_params.monitor=val_wer',
         '++exp_manager.checkpoint_callback_params.save_last=true',
         f'++exp_manager.checkpoint_callback_params.every_n_train_steps={CKPT_EVERY_N_STEPS}',
+        '++exp_manager.checkpoint_callback_params.every_n_epochs=null',   # disable; conflict with every_n_train_steps
         f'++trainer.val_check_interval={CKPT_EVERY_N_STEPS}',
     ]
 
@@ -983,8 +986,8 @@ def main():
         logger.info("── Step 1/9: Setup ──")
         cfg = setup()
 
-        # Step 2: Data Ingest
-        logger.info("── Step 2/9: Data Ingest ──")
+        # Step 2: Data Ingest (KO first — largest, then others fall in Step 4)
+        logger.info("── Step 2/9: Data Ingest (KO) ──")
         temp_path, n_entries = data_ingest()
         if n_entries == 0:
             raise RuntimeError("No data ingested. Check dataset access.")
@@ -993,7 +996,7 @@ def main():
         logger.info("── Step 3/9: Build Manifests ──")
         manifests = build_manifests(temp_path)
 
-        # Step 4: Language Mix
+        # Step 4: Language Mix (ingests other languages as needed)
         logger.info("── Step 4/9: Language Mix ──")
         mixed_path = language_mix(manifests)
 
